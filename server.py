@@ -23,6 +23,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 from webdriver_manager.chrome import ChromeDriverManager
+from dotenv import load_dotenv
+
+# 加载环境变量 (默认读取 .env)
+load_dotenv()
+
 
 # --- 1. 日志净化 ---
 # 禁用 Flask 默认的请求日志，只保留错误
@@ -67,6 +72,7 @@ DRIVER_LOCK = threading.Lock()
 # 任务管理器
 TASK_MANAGER = {}
 TASK_LOCK = threading.Lock()
+ALLOWLIST_LOCK = threading.Lock()
 
 # 全局日志缓冲区
 GLOBAL_LOGS = []
@@ -94,8 +100,8 @@ def send_email_notification(receiver, account_name, order_info):
 
     smtp_server = "smtp.qq.com"
     smtp_port = 465
-    sender = os.environ.get("EMAIL_SENDER", "YOUR_EMAIL@qq.com")
-    password = os.environ.get("EMAIL_PASSWORD", "YOUR_AUTHORIZATION_CODE")
+    sender = "1696725502@qq.com"
+    password = "voqujocowzfrccdh"  # 授权码
 
     subject = f'🏸 订场成功提醒：账号 {account_name} 需要付款'
 
@@ -127,8 +133,8 @@ def send_lock_failed_email(receiver, account_name, venue_name, fail_reason="未�
 
     smtp_server = "smtp.qq.com"
     smtp_port = 465
-    sender = os.environ.get("EMAIL_SENDER", "YOUR_EMAIL@qq.com")
-    password = os.environ.get("EMAIL_PASSWORD", "YOUR_AUTHORIZATION_CODE")
+    sender = "1696725502@qq.com"
+    password = "voqujocowzfrccdh"  # 授权码
 
     subject = f'⚠️ 锁场失败警告：账号 {account_name} 场地已丢失'
 
@@ -464,7 +470,6 @@ def execute_login_logic(username, password):
 #                    add_log("⏳ 等待跳转...")
                     time.sleep(2)
             continue
-        
 
     # 超时
     close_driver(driver)
@@ -820,7 +825,7 @@ def try_rescue_token(username, reason="unknown"):
         return False
 
 
-# --- Workers --- 执行场地预定规则
+# --- Workers ---
 
 def monitor_worker(task_id, stop_event, token, user_id_obj, date, start_time, end_time, is_lock_mode, initial_price=40,
                    email_receiver=None, account_name=None, target_venue_id=None, target_venue_name=None):
@@ -1039,13 +1044,14 @@ def check_whitelist(username):
             return False
 
         allowed = set()
-        with open(allowlist_path, "r", encoding="utf-8") as f:
-            for line in f:
-                # 支持行内注释：只取 # 前面的部分
-                s = (line or "").split("#")[0].strip()
-                if not s:
-                    continue
-                allowed.add(s)
+        with ALLOWLIST_LOCK:
+            with open(allowlist_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    # 去除行内注释和空白
+                    s = line.split('#')[0].strip()
+                    if not s:
+                        continue
+                    allowed.add(s)
 
         return str(username).strip() in allowed
     except Exception as e:
@@ -1477,7 +1483,129 @@ def get_logs_endpoint():
     with TASK_LOCK:
         return jsonify(GLOBAL_LOGS)
 
+# ================= Admin 管理后台接口 =================
+
+def _admin_key_ok(req):
+    """ 校验管理密钥 """
+    env_key = os.environ.get("SCUT_ADMIN_KEY", "")
+    if not env_key: return True # 如果没设密码，默认允许（不建议）
+    
+    req_key = req.args.get("key") or req.headers.get("X-Admin-Key") or ""
+    return req_key.strip() == env_key.strip()
+
+@app.route("/admin", methods=["GET"])
+def admin_page():
+    # 只有 Admin 模式或密钥正确才允许访问
+    if not _admin_key_ok(request):
+        return "Access Denied: Invalid Key", 403
+
+    allowlist_path = os.environ.get("SCUT_ALLOWLIST_FILE", "allowed_users.txt")
+    content = ""
+    try:
+        if os.path.exists(allowlist_path):
+            with ALLOWLIST_LOCK:
+                with open(allowlist_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+    except Exception as e:
+        content = f"读取文件出错: {e}"
+
+    # 简单的 HTML 界面
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>SCUT 白名单管理</title>
+        <style>body{{font-family: sans-serif; padding: 20px;}} textarea{{width:100%; height:300px; margin-top:10px;}}</style>
+    </head>
+    <body>
+        <h2>🔐 SCUT 白名单管理后台</h2>
+        <form onsubmit="addUser(); return false;">
+            <input type="text" id="u" placeholder="输入学号/账号" required style="padding:5px;">
+            <button type="submit" style="padding:5px 10px; cursor:pointer;">添加用户</button>
+        </form>
+        <p>当前白名单内容：</p>
+        <textarea id="list" readonly>{content}</textarea>
+        
+        <script>
+            async function addUser() {{
+                const u = document.getElementById('u').value;
+                const key = new URLSearchParams(window.location.search).get("key") || "";
+                if(!u) return;
+                
+                try {{
+                    const res = await fetch('/admin/add?key=' + key, {{
+                        method: 'POST',
+                        headers: {{'Content-Type': 'application/json'}},
+                        body: JSON.stringify({{username: u}})
+                    }});
+                    const j = await res.json();
+                    if(j.status === 'success') {{
+                        alert('添加成功！');
+                        location.reload();
+                    }} else {{
+                        alert('失败: ' + j.msg);
+                    }}
+                }} catch(e) {{ alert(e); }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    return html
+
+@app.route("/admin/add", methods=["POST"])
+def admin_add_user():
+    if not _admin_key_ok(request):
+        return jsonify({"status": "denied", "msg": "Invalid Key"}), 403
+        
+    data = request.json or {}
+    username = str(data.get("username", "")).strip()
+    if not username:
+        return jsonify({"status": "error", "msg": "用户名不能为空"}), 400
+        
+    allowlist_path = os.environ.get("SCUT_ALLOWLIST_FILE", "allowed_users.txt")
+    
+    try:
+        # 输入清洗：去除首尾空格，禁止换行符
+        username = username.replace("\n", "").replace("\r", "")
+        if not username:
+             return jsonify({"status": "error", "msg": "无效的用户名"}), 400
+
+        with ALLOWLIST_LOCK:
+            # 简单的去重检查
+            current_users = set()
+            if os.path.exists(allowlist_path):
+                with open(allowlist_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        # 同样处理注释
+                        s = line.split('#')[0].strip()
+                        if s:
+                            current_users.add(s)
+            
+            if username in current_users:
+                 return jsonify({"status": "error", "msg": "用户已存在"}), 400
+
+            with open(allowlist_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{username}")
+            
+        return jsonify({"status": "success"})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": str(e)}), 500
+
 
 if __name__ == '__main__':
-    print("🚀 Backend Started on 5001... (Multi-User Supported)")
-    app.run(port=5001, threaded=True)
+    # === 关键修改：从环境变量读取配置 ===
+    # 这样 systemd 里的 SCUT_PORT=5000 才能生效
+    host = os.environ.get("SCUT_HOST", "0.0.0.0")
+    port = int(os.environ.get("SCUT_PORT", "5001"))
+    
+    # 判断当前是 Admin 模式还是 Backend 模式
+    is_admin = os.environ.get("SCUT_ADMIN_ONLY", "0") == "1"
+    
+    if is_admin:
+        print(f"🔐 Admin Service Started on {host}:{port}")
+    else:
+        print(f"🚀 Backend Service Started on {host}:{port} (Multi-User Supported)")
+        
+    app.run(host=host, port=port, threaded=True)
