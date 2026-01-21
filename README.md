@@ -2,6 +2,11 @@
 
 这是一个基于 Flask (后端) 和 React (前端) 的华工羽毛球场自动订场系统。旨在自动化解决订场难、繁琐的问题，支持智能登录、多账号管理、自动抢票及无限锁场等高级功能。
 
+
+## 📸 界面预览 (Screenshots)
+
+![Dashboard Example](assets/main_page.png)
+
 ## ✨ 主要特性 (Features)
 
 *   **智能登录系统**：

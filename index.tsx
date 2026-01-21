@@ -125,7 +125,7 @@ const AccessDeniedModal = ({ isOpen, onClose }: any) => {
                 </div>
                 <h2 style={{ margin: '0 0 10px 0', color: '#333' }}>访问受限</h2>
                 <div style={{ fontSize: 16, color: '#666', lineHeight: 1.6, marginBottom: 25 }}>
-                    需要获取权限请联系 <strong>1696725502@qq.com</strong> 这个邮箱，并备注相关理由。
+                    需要获取权限请联系 <strong>ziqiangtang9@gmail.com</strong> 这个邮箱，并备注相关理由。
                 </div>
                 <button
                     onClick={onClose}
@@ -612,7 +612,7 @@ const DashboardView = ({
             {/* Header */}
             <div style={{ padding: '20px 30px', background: '#fff', borderBottom: '1px solid #eee', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <h2 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 12, color: '#1f1f1f' }}>
-                    <span style={{ fontSize: 28 }}>🏸</span> 华工羽毛球场地预定表
+                    <span style={{ fontSize: 28 }}>🏸</span> 华工西体羽毛球场地预定表
                 </h2>
                 <div style={{ display: 'flex', gap: 15, alignItems: 'center' }}>
                     <div style={{ padding: '0 15px', display: 'flex', alignItems: 'center', gap: 6, color: '#666', fontSize: 14, background: '#f5f5f5', borderRadius: 6, height: 40 }}>
