@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import json
 import time
@@ -27,6 +27,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from dotenv import load_dotenv
 
 # 加载环境变量 (默认读取 .env)
+# 加载环境变量 (默认读取 .env)
 load_dotenv()
 
 
@@ -35,7 +36,8 @@ load_dotenv()
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-app = Flask(__name__)
+# 设定静态文件目录为 dist (即 npm run build 的产物)
+app = Flask(__name__, static_folder='dist', static_url_path='')
 # 允许跨域
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -1549,6 +1551,29 @@ def get_logs_endpoint():
     with TASK_LOCK:
         return jsonify(GLOBAL_LOGS)
 
+    with TASK_LOCK:
+        return jsonify(GLOBAL_LOGS)
+
+# ================= 静态文件服务 (Frontend) =================
+
+@app.route('/')
+def serve_index():
+    """服务 React 前端入口"""
+    if os.path.exists(app.static_folder):
+        return send_from_directory(app.static_folder, 'index.html')
+    else:
+        return "Frontend not found. Please run 'npm run build' first.", 404
+
+@app.errorhandler(404)
+def not_found(e):
+    """React Router 兼容：404 fallback 到 index.html"""
+    if request.path.startswith("/api") or request.path.startswith("/admin"):
+         return jsonify({"error": "Not found"}), 404
+    
+    if os.path.exists(app.static_folder):
+        return send_from_directory(app.static_folder, 'index.html')
+    return e
+
 # ================= Admin 管理后台接口 =================
 
 def _admin_key_ok(req):
@@ -1664,7 +1689,8 @@ if __name__ == '__main__':
     # === 关键修改：从环境变量读取配置 ===
     # 这样 systemd 里的 SCUT_PORT=5000 才能生效
     host = os.environ.get("SCUT_HOST", "0.0.0.0")
-    port = int(os.environ.get("SCUT_PORT", "5001"))
+    # 修改默认端口为 5000，与 README 和 package.json 保持一致
+    port = int(os.environ.get("SCUT_PORT", "5000"))
     
     # 判断当前是 Admin 模式还是 Backend 模式
     is_admin = os.environ.get("SCUT_ADMIN_ONLY", "0") == "1"
@@ -1673,5 +1699,6 @@ if __name__ == '__main__':
         print(f"🔐 Admin Service Started on {host}:{port}")
     else:
         print(f"🚀 Backend Service Started on {host}:{port} (Multi-User Supported)")
+        print(f"📂 Serving Static Files from: {os.path.abspath('dist')}")
         
     app.run(host=host, port=port, threaded=True)
