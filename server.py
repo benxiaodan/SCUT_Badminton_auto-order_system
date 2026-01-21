@@ -16,6 +16,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 import atexit
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -194,18 +195,69 @@ def send_lock_failed_email(receiver, account_name, venue_name, fail_reason="未�
 
 def kill_zombie_processes():
     """ 
-    尝试清理残留的 chrome 进程
-    现在改用精确的 PID 清理，此函数主要作为手动触发的强力GC 
+    强制清理所有相关的残留进程
     """
     cleanup_at_exit()
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/IM", "chromedriver.exe", "/T"], capture_output=True)
+        else:
+            subprocess.run(["pkill", "-9", "chromedriver"], capture_output=True)
+        add_log("🧹 已执行僵尸进程强力清理")
+    except Exception as e:
+        add_log(f"⚠️ 清理异常: {e}")
+
+def process_health_check():
+    """
+    进程健康巡检：主动发现并清理不属于当前活跃列表的残留进程
+    """
+    add_log("🔍 [HealthCheck] 启动进程健检...")
+    try:
+        if sys.platform == "win32":
+            # 获取所有 chromedriver.exe 的 PID
+            output = subprocess.check_output('tasklist /FI "IMAGENAME eq chromedriver.exe" /FO CSV /NH', shell=True).decode('gbk', errors='ignore')
+            lines = [l.strip() for l in output.strip().split('\n') if l.strip()]
+            for line in lines:
+                if 'chromedriver.exe' in line:
+                    parts = line.split(',')
+                    if len(parts) > 1:
+                        pid = int(parts[1].strip('"'))
+                        with PID_LOCK:
+                            if pid not in ACTIVE_DRIVER_PIDS:
+                                add_log(f"🗑️ [HealthCheck] 发现孤立进程 {pid}, 正在清理...")
+                                subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], capture_output=True)
+        else:
+            # Linux 环境下通过 pgrep 查找
+            try:
+                output = subprocess.check_output(["pgrep", "chromedriver"]).decode().strip()
+                if output:
+                    pids = [int(p) for p in output.split()]
+                    for pid in pids:
+                        with PID_LOCK:
+                            if pid not in ACTIVE_DRIVER_PIDS:
+                                add_log(f"🗑️ [HealthCheck] 发现孤立进程 {pid}, 正在清理...")
+                                subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+            except subprocess.CalledProcessError:
+                pass # pgrep returns non-zero if no process found
+    except Exception as e:
+        add_log(f"⚠️ [HealthCheck] 巡检异常: {e}")
 
 def init_browser():
     """ 
     工厂模式：每次调用返回全新的 driver 实例 
-    不再依赖全局 driver_instance 
+    添加随机化指纹（User-Agent, 分辨率）和 Selenium 特征隐藏
     """
     global DRIVER_PATH
     
+    # 候选 UA 列表
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    ]
+    selected_ua = random.choice(USER_AGENTS)
+
     # 1. 驱动检查 - 优先使用系统常见路径
     if not DRIVER_PATH:
         possible_paths = [
@@ -217,48 +269,53 @@ def init_browser():
         for p in possible_paths:
             if os.path.exists(p):
                 DRIVER_PATH = p
-#                add_log(f"✅ 使用系统驱动: {p}")
                 break
-        
-        # 找不到则尝试自动下载
         if not DRIVER_PATH:
-            try: DRIVER_PATH = ChromeDriverManager().install()
+            try:
+                from webdriver_manager.chrome import ChromeDriverManager
+                DRIVER_PATH = ChromeDriverManager().install()
             except: pass
 
     if not DRIVER_PATH:
         add_log("❌ 致命错误: 未找到 ChromeDriver")
         return None
 
-    # 2. 启动逻辑 (使用 port=0 解决端口冲突)
+    # 2. 获取并发许可
+    acquired = BROWSER_SEMAPHORE.acquire(blocking=True, timeout=30)
+    if not acquired:
+        add_log("⏳ 服务器繁忙: 浏览器实例已达上限，请稍后...")
+        return None
+
     options = webdriver.ChromeOptions()
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    
-    # 允许通过环境变量控制是否开启 headless (方便调试)
     if os.environ.get("HEADLESS", "true").lower() != "false":
         options.add_argument("--headless=new")
         
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--remote-debugging-port=0") # 关键：随机端口
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    options.add_argument("--remote-debugging-port=0")
+    options.add_argument(f"--user-agent={selected_ua}")
     
-    # 3. 获取并发许可
-    acquired = BROWSER_SEMAPHORE.acquire(blocking=True, timeout=30)
-    if not acquired:
-        add_log("⏳ 服务器繁忙: 浏览器实例已达上限，请稍后...")
-        return None
+    # 隐藏 Selenium 特征
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    # 随机化窗口大小
+    width = random.randint(1024, 1920)
+    height = random.randint(768, 1080)
+    options.add_argument(f"--window-size={width},{height}")
 
     try:
         for attempt in range(2):
             try:
-                # 每次实例化一个新的 Service，确保端口独立
                 service = Service(executable_path=DRIVER_PATH, port=0)
                 driver = webdriver.Chrome(service=service, options=options)
                 driver.set_page_load_timeout(30)
                 
-                # 标记该 driver 已持有信号量
+                # 隐藏 navigator.webdriver
+                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                
                 driver._semaphore_acquired = True
                 
                 # 记录 PID
@@ -274,12 +331,11 @@ def init_browser():
             except Exception as e:
                 add_log(f"⚠️ 启动尝试 {attempt+1} 失败: {e}")
                 if attempt == 1:
-                    # 最后一次尝试失败，需要释放信号量
                     BROWSER_SEMAPHORE.release()
                     return None
     except:
-        # 异常兜底释放
         BROWSER_SEMAPHORE.release()
+        return None
         return None
 
 
@@ -1091,6 +1147,11 @@ def monitor_worker(task_id, stop_event, token, user_id_obj, date, start_time, en
                             TASK_MANAGER[task_id]['status'] = f"抢票成功: {target_session['venueName']}"
                     add_log(f"✅ 抢票成功，任务结束。")
                     stop_event.set()
+        
+        # --- 核心改进：引入随机休眠，降低扫描频率 ---
+        if not stop_event.is_set():
+            sleep_time = random.uniform(1.0, 3.0)
+            time.sleep(sleep_time)
 
 
 # ================= API Endpoints =================
