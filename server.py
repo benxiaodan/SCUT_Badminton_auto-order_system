@@ -15,6 +15,7 @@ import logging
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
+import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -40,6 +41,33 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ================= 全局变量与任务管理 =================
 DRIVER_PATH = None
+
+# --- 并发与资源控制 ---
+# 限制同时运行的浏览器数量 (防止内存/CPU爆炸)
+BROWSER_LIMIT = 2
+BROWSER_SEMAPHORE = threading.Semaphore(BROWSER_LIMIT)
+
+# 活跃浏览器进程 ID 集合 (用于精确清理)
+ACTIVE_DRIVER_PIDS = set()
+PID_LOCK = threading.Lock()
+
+def cleanup_at_exit():
+    """ 退出时清理所有残留的浏览器进程 """
+    with PID_LOCK:
+        if not ACTIVE_DRIVER_PIDS:
+            return
+        print(f"🧹 正在清理 {len(ACTIVE_DRIVER_PIDS)} 个残留浏览器进程...")
+        for pid in list(ACTIVE_DRIVER_PIDS):
+            try:
+                if sys.platform.startswith('win'):
+                    subprocess.run(f"taskkill /F /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    os.kill(pid, 9)
+            except:
+                pass
+        ACTIVE_DRIVER_PIDS.clear()
+
+atexit.register(cleanup_at_exit)
 
 # --- 多用户隔离设计 ---
 # USER_SESSIONS 存储结构: 
@@ -77,6 +105,7 @@ ALLOWLIST_LOCK = threading.Lock()
 # 全局日志缓冲区
 GLOBAL_LOGS = []
 MAX_LOG_LENGTH = 200
+LOG_LOCK = threading.Lock()
 
 def add_log(msg):
     """ 添加日志到全局缓冲区，并打印到控制台 """
@@ -85,7 +114,7 @@ def add_log(msg):
     print(full_msg)
     sys.stdout.flush()
 
-    with TASK_LOCK:
+    with LOG_LOCK:
         GLOBAL_LOGS.append(full_msg)
         if len(GLOBAL_LOGS) > MAX_LOG_LENGTH:
             GLOBAL_LOGS.pop(0)
@@ -143,7 +172,7 @@ def send_lock_failed_email(receiver, account_name, venue_name, fail_reason="未�
 目标场地：{venue_name}
 失败原因：{fail_reason}
 
-系统尝试在5秒内连续续订失败，场地可能已被他人抢走或系统限制。
+系统尝试在10秒内连续续订失败，场地可能已被他人抢走或系统限制。
 锁场模式已自动停止，请人工检查。
 (本邮件由华工羽毛球订场助手自动发送)"""
 
@@ -162,14 +191,11 @@ def send_lock_failed_email(receiver, account_name, venue_name, fail_reason="未�
 # ================= 浏览器与登录核心 =================
 
 def kill_zombie_processes():
-    """ 尝试清理残留的 chrome 进程，防止端口占用 """
-    try:
-        if sys.platform.startswith('linux'):
-            # 使用 shell=True 和 -9 强力查杀
-            subprocess.run("pkill -9 -f chrome", shell=True)
-            subprocess.run("pkill -9 -f chromedriver", shell=True)
-            time.sleep(1) 
-    except: pass
+    """ 
+    尝试清理残留的 chrome 进程
+    现在改用精确的 PID 清理，此函数主要作为手动触发的强力GC 
+    """
+    cleanup_at_exit()
 
 def init_browser():
     """ 
@@ -204,7 +230,11 @@ def init_browser():
     # 2. 启动逻辑 (使用 port=0 解决端口冲突)
     options = webdriver.ChromeOptions()
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    options.add_argument("--headless=new")  # 必须开启 headless
+    
+    # 允许通过环境变量控制是否开启 headless (方便调试)
+    if os.environ.get("HEADLESS", "true").lower() != "false":
+        options.add_argument("--headless=new")
+        
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -212,23 +242,59 @@ def init_browser():
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
     
-    for attempt in range(2):
-        try:
-            # 每次实例化一个新的 Service，确保端口独立
-            service = Service(executable_path=DRIVER_PATH, port=0)
-            driver = webdriver.Chrome(service=service, options=options)
-            driver.set_page_load_timeout(30)
-            return driver
-        except Exception as e:
-            add_log(f"⚠️ 启动尝试 {attempt+1} 失败: {e}")
-            if attempt == 0:
-                pass # kill_zombie_processes() # 禁用以免误杀其他用户的浏览器
-            else:
-                return None
+    # 3. 获取并发许可
+    acquired = BROWSER_SEMAPHORE.acquire(blocking=True, timeout=30)
+    if not acquired:
+        add_log("⏳ 服务器繁忙: 浏览器实例已达上限，请稍后...")
+        return None
+
+    try:
+        for attempt in range(2):
+            try:
+                # 每次实例化一个新的 Service，确保端口独立
+                service = Service(executable_path=DRIVER_PATH, port=0)
+                driver = webdriver.Chrome(service=service, options=options)
+                driver.set_page_load_timeout(30)
+                
+                # 标记该 driver 已持有信号量
+                driver._semaphore_acquired = True
+                
+                # 记录 PID
+                try:
+                    pid = driver.service.process.pid
+                    with PID_LOCK:
+                        ACTIVE_DRIVER_PIDS.add(pid)
+                    driver._pid = pid
+                except:
+                    pass
+                
+                return driver
+            except Exception as e:
+                add_log(f"⚠️ 启动尝试 {attempt+1} 失败: {e}")
+                if attempt == 1:
+                    # 最后一次尝试失败，需要释放信号量
+                    BROWSER_SEMAPHORE.release()
+                    return None
+    except:
+        # 异常兜底释放
+        BROWSER_SEMAPHORE.release()
+        return None
 
 
 def close_driver(driver):
     if driver:
+        # 1. 释放信号量
+        if getattr(driver, '_semaphore_acquired', False):
+            BROWSER_SEMAPHORE.release()
+            driver._semaphore_acquired = False
+            
+        # 2. 移除 PID 记录
+        pid = getattr(driver, '_pid', None)
+        if pid:
+            with PID_LOCK:
+                ACTIVE_DRIVER_PIDS.discard(pid)
+
+        # 3. 关闭驱动
         try:
             driver.quit()
         except:

@@ -1,0 +1,9 @@
+flask
+flask-cors
+requests
+selenium
+webdriver-manager
+
+trio-websocket
+typing_extensions
+
