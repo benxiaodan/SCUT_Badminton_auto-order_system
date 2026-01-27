@@ -1,0 +1,14 @@
+[Unit]
+Description=SCUT Badminton Celery Worker
+After=network.target redis-server.service
+
+[Service]
+User=root
+WorkingDirectory=/var/www/scut_new
+Environment="PATH=/var/www/scut_new/venv/bin"
+Environment="C_FORCE_ROOT=true"
+ExecStart=/var/www/scut_new/venv/bin/celery -A celery_worker worker --loglevel=info
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

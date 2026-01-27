@@ -1,0 +1,13 @@
+[Unit]
+Description=SCUT Badminton API (FastAPI)
+After=network.target redis-server.service
+
+[Service]
+User=root
+WorkingDirectory=/var/www/scut_new
+Environment="PATH=/var/www/scut_new/venv/bin"
+ExecStart=/var/www/scut_new/venv/bin/uvicorn main:app --host 0.0.0.0 --port 5003 --no-access-log
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
