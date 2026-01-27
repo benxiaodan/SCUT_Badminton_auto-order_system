@@ -9,7 +9,8 @@ from core import (
     close_driver, sniff_token, fetch_orders_internal, send_booking_request,
     kill_zombie_processes, USER_SESSIONS, SESSION_LOCK, check_token_validity,
     load_sessions_from_file, save_sessions_to_file, save_session_to_redis, get_session_from_redis,
-    save_task_to_redis, remove_task_from_redis, load_all_tasks_from_redis
+    save_task_to_redis, remove_task_from_redis, load_all_tasks_from_redis,
+    send_lock_failed_email
 )
 from selenium.webdriver.common.by import By
 from monthly_booking import (
@@ -680,14 +681,14 @@ async def book_direct(request: Request):
 
 
 def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time, 
-                venue_id, price, account_name, venue_name):
+                venue_id, price, account_name, venue_name, email=None):
     """
     锁场保活 Worker - 基于精确时间点的续订逻辑
     
     设计原理：
     1. 记录每次预定/续订成功的精确时间点 (last_success_time)
     2. 在成功后 8 分钟检测 Token 有效性
-    3. 在成功后 9分55秒（即10分钟到期前5秒）开始续订
+    3. 在成功后 9分30秒（即10分钟到期前30秒）开始续订
     4. 续订窗口为 60 秒
     5. 续订成功后更新 last_success_time，进入下一轮循环
     """
@@ -713,7 +714,7 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
 
     # 时间配置（秒）
     TOKEN_CHECK_DELAY = 8 * 60       # 8分钟后检测Token
-    RENEW_START_DELAY = 9 * 60 + 55  # 9分55秒后开始续订（10分钟到期前5秒）
+    RENEW_START_DELAY = 9 * 60 + 30  # 9分30秒后开始续订（10分钟到期前30秒，多留安全边际）
     RENEW_WINDOW = 60                # 续订窗口60秒
 
     try:
@@ -796,6 +797,9 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
             
             if not round_success and not stop_event.is_set():
                 add_log(f"❌ [Task {task_id}] 本轮续订失败，场地可能已丢失。", username=account_name)
+                # 发送失败邮件通知
+                if email:
+                    send_lock_failed_email(email, account_name, venue_name, f"第 {renew_count + 1} 次续订失败，60秒窗口内所有尝试均未成功")
                 with TASK_LOCK:
                     if task_id in TASK_MANAGER:
                         TASK_MANAGER[task_id]['status'] = "续订失败"
@@ -818,7 +822,7 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
 
 
 def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time, 
-                price, username, target_venue_id=None):
+                price, username, target_venue_id=None, email=None):
     """
     自动捡漏/扫场 Worker
     1. 轮询场地状态
@@ -929,7 +933,7 @@ def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time
                 # 启动锁场线程 (复用 lock_worker)
                 lock_worker(
                     task_id, stop_event, current_token, user_id, date, start_time, end_time,
-                    v_id, v_price, username, v_name
+                    v_id, v_price, username, v_name, email
                 )
                 return 
                 
@@ -1019,7 +1023,7 @@ async def start_monitor(request: Request):
             # 启动 lock_worker 线程
             t = threading.Thread(target=lock_worker, args=(
                 tid, stop_event, token, user_id, date, start_time, end_time,
-                venue_id, price, username, venue_name
+                venue_id, price, username, venue_name, email
             ))
             t.daemon = True
             t.start()
@@ -1046,7 +1050,7 @@ async def start_monitor(request: Request):
     
     t = threading.Thread(target=snipe_worker, args=(
         tid, stop_event, token, user_id, date, start_time, end_time,
-        price, username, venue_id
+        price, username, venue_id, email
     ))
     t.daemon = True
     t.start()

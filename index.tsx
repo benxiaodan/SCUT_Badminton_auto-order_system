@@ -1248,9 +1248,9 @@ const MonthlyTaskCard = ({ task, onCancel }: { task: any, onCancel: () => void }
 const App = () => {
     const [view, setView] = useState<'login' | 'dashboard' | 'monthly'>('login');
 
-    const [username, setUsername] = useState('');
-    const [password, setPassword] = useState('');
-    const [email, setEmail] = useState(''); // 用户邮箱
+    const [username, setUsername] = useState('202421003514');
+    const [password, setPassword] = useState('20030611y$Y');
+    const [email, setEmail] = useState('1696725502@qq.com'); // 用户邮箱
 
     const [status, setStatus] = useState<'idle' | 'checking' | '2fa_needed' | 'success' | 'error' | 'fetching_data' | 'reconnecting'>('idle');
     const [errorMsg, setErrorMsg] = useState('');

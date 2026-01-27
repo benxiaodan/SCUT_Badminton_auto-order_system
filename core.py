@@ -192,8 +192,8 @@ def send_email_notification(receiver, account_name, order_info):
 
     smtp_server = "smtp.qq.com"
     smtp_port = 465
-    sender = os.environ.get("SMTP_SENDER", "your_email@qq.com")
-    password = os.environ.get("SMTP_PASSWORD", "your_smtp_password")  # 授权码
+    sender = "1696725502@qq.com"
+    password = "voqujocowzfrccdh"  # 授权码
 
     subject = f'🏸 订场成功提醒：账号 {account_name} 需要付款'
 
@@ -215,6 +215,40 @@ def send_email_notification(receiver, account_name, order_info):
         smtp_obj.login(sender, password)
         smtp_obj.sendmail(sender, [receiver], message.as_string())
         add_log(f"📧 邮件通知已发送至 -> {receiver}")
+    except Exception as e:
+        add_log(f"❌ 邮件发送失败: {e}")
+
+def send_lock_failed_email(receiver, account_name, venue_name, fail_reason="未知原因"):
+    """ 发送锁场失败/掉单通知 """
+    if not receiver:
+        return
+
+    smtp_server = "smtp.qq.com"
+    smtp_port = 465
+    sender = "1696725502@qq.com"
+    password = "voqujocowzfrccdh"  # 授权码
+
+    subject = f'⚠️ 锁场失败警告：账号 {account_name} 场地已丢失'
+
+    content = f"""账号 [{account_name}] 锁场模式异常退出！
+
+目标场地：{venue_name}
+失败原因：{fail_reason}
+
+系统尝试在60秒内连续续订失败，场地可能已被他人抢走或系统限制。
+锁场模式已自动停止，请人工检查。
+(本邮件由华工羽毛球订场助手自动发送)"""
+
+    message = MIMEText(content, 'plain', 'utf-8')
+    message['From'] = sender
+    message['To'] = receiver
+    message['Subject'] = Header(subject, 'utf-8')
+
+    try:
+        smtp_obj = smtplib.SMTP_SSL(smtp_server, smtp_port)
+        smtp_obj.login(sender, password)
+        smtp_obj.sendmail(sender, [receiver], message.as_string())
+        add_log(f"📧 失败报警邮件已发送至 -> {receiver}")
     except Exception as e:
         add_log(f"❌ 邮件发送失败: {e}")
 

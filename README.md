@@ -50,15 +50,25 @@ sudo systemctl enable redis-server
 sudo systemctl start redis-server
 
 # 4. 安装 Chrome 浏览器
-wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-sudo apt update
-sudo apt install google-chrome-stable -y
+wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sudo apt install ./google-chrome-stable_current_amd64.deb -y
 
-# 5. 安装 Chrome 依赖库
-sudo apt install -y libnss3 libgconf-2-4 libxss1 libasound2 libatk1.0-0 libgtk-3-0
+# 5. 修复依赖（Chrome 安装时会自动安装大部分依赖）
+sudo apt --fix-broken install -y
 
-# 6. 安装 Node.js（仅在需要本地构建前端时）
+# 6. 安装 ChromeDriver（需与 Chrome 版本匹配）
+# 查看 Chrome 版本
+google-chrome --version
+# 下载对应版本的 ChromeDriver（以下以 131 版本为例，请根据实际版本调整）
+wget https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.204/linux64/chromedriver-linux64.zip
+sudo apt install unzip -y
+unzip chromedriver-linux64.zip
+sudo mv chromedriver-linux64/chromedriver /usr/local/bin/
+sudo chmod +x /usr/local/bin/chromedriver
+# 验证安装
+chromedriver --version
+
+# 7. 安装 Node.js（仅在需要本地构建前端时）
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
 sudo apt install -y nodejs
 ```
@@ -95,8 +105,6 @@ source venv/bin/activate
 ### 第四步：安装 Python 依赖
 
 ```bash
-cd /var/www/scut_new
-source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -125,10 +133,10 @@ SCUT_ALLOWLIST_FILE=allowed_users.txt
 nano allowed_users.txt
 ```
 
-格式（每行一个学号）：
+格式（每行一个学号）：（井号后为注释）
 ```
-202320100334
-202320100335
+202320100334 # 2023级 某某某
+202320100335 # 2023级
 ```
 
 ### 第七步：安装 systemd 服务

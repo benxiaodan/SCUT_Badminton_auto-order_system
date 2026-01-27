@@ -132,8 +132,8 @@ def send_email_notification(receiver, account_name, order_info):
 
     smtp_server = "smtp.qq.com"
     smtp_port = 465
-    sender = os.environ.get("SMTP_SENDER", "your_email@qq.com")
-    password = os.environ.get("SMTP_PASSWORD", "your_smtp_password")  # 授权码
+    sender = "1696725502@qq.com"
+    password = "voqujocowzfrccdh"  # 授权码
 
     subject = f'🏸 订场成功提醒：账号 {account_name} 需要付款'
 
@@ -165,8 +165,8 @@ def send_lock_failed_email(receiver, account_name, venue_name, fail_reason="未�
 
     smtp_server = "smtp.qq.com"
     smtp_port = 465
-    sender = os.environ.get("SMTP_SENDER", "your_email@qq.com")
-    password = os.environ.get("SMTP_PASSWORD", "your_smtp_password")  # 授权码
+    sender = "1696725502@qq.com"
+    password = "voqujocowzfrccdh"  # 授权码
 
     subject = f'⚠️ 锁场失败警告：账号 {account_name} 场地已丢失'
 
