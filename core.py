@@ -43,69 +43,238 @@ DRIVER_PATH = get_chromedriver_path()
 BROWSER_SEMAPHORE = threading.Semaphore(int(os.environ.get("BROWSER_LIMIT", 2)))
 ACTIVE_DRIVER_PIDS = set()
 PID_LOCK = threading.Lock()
-PENDING_DRIVERS = {} # 存储等待 2FA 的 driver
+# 存储等待 2FA 的 driver: {username: {"driver": driver, "timestamp": time, "last_attempt": time}}
+PENDING_DRIVERS = {}
 DRIVER_MAP_LOCK = threading.Lock()
 
-# --- 会话管理 (新增，用于自动救援) ---
-USER_SESSIONS = {}
-SESSION_LOCK = threading.Lock()
-SESSION_FILE = "sessions.json"
+# --- 会话管理 (Redis 作为唯一数据源) ---
+# =========================================
+# 设计原则：Redis 是用户与系统之间的唯一数据桥梁
+# - 所有数据更新 → 写入 Redis
+# - 所有数据读取 → 从 Redis 获取
+# =========================================
+
+SESSION_TTL = 86400  # Session 24小时过期
+CACHE_TTL = 300      # 缓存 5分钟过期
+
+# === 新版 Session 操作 (Redis Only) ===
+
+def save_session(username, session_data):
+    """保存用户会话到 Redis (唯一存储)"""
+    try:
+        key = f"scut_order:session:{username}"
+        # 确保 last_updated 字段
+        session_data['last_updated'] = time.time()
+        redis_client.set(key, json.dumps(session_data, ensure_ascii=False), ex=SESSION_TTL)
+        return True
+    except Exception as e:
+        add_log(f"⚠️ Session 保存失败: {e}")
+        return False
+
+def get_session(username):
+    """从 Redis 获取用户会话"""
+    try:
+        key = f"scut_order:session:{username}"
+        data = redis_client.get(key)
+        if data:
+            return json.loads(data) if isinstance(data, str) else json.loads(data.decode('utf-8'))
+        return None
+    except Exception as e:
+        add_log(f"⚠️ Session 读取失败: {e}")
+        return None
+
+def update_session_field(username, field, value):
+    """更新会话的某个字段"""
+    session = get_session(username) or {}
+    session[field] = value
+    session['last_updated'] = time.time()
+    save_session(username, session)
+
+def delete_session(username):
+    """删除用户会话"""
+    try:
+        key = f"scut_order:session:{username}"
+        redis_client.delete(key)
+    except:
+        pass
+
+def get_all_sessions():
+    """获取所有用户会话 (用于自动续期等场景)"""
+    sessions = {}
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor, match="scut_order:session:*", count=100)
+            for key in keys:
+                username = key.replace("scut_order:session:", "")
+                data = redis_client.get(key)
+                if data:
+                    sessions[username] = json.loads(data) if isinstance(data, str) else json.loads(data.decode('utf-8'))
+            if cursor == 0:
+                break
+    except Exception as e:
+        add_log(f"⚠️ 批量读取 Session 失败: {e}")
+    return sessions
+
+# === 订单缓存操作 (Redis Only) ===
+
+def save_order_cache(username, cache_data):
+    """保存订单缓存到 Redis"""
+    try:
+        key = f"scut_order:cache:orders:{username}"
+        redis_client.set(key, json.dumps(cache_data, ensure_ascii=False), ex=CACHE_TTL)
+        return True
+    except Exception as e:
+        add_log(f"⚠️ 订单缓存保存失败: {e}")
+        return False
+
+def get_order_cache(username):
+    """从 Redis 获取订单缓存"""
+    try:
+        key = f"scut_order:cache:orders:{username}"
+        data = redis_client.get(key)
+        if data:
+            return json.loads(data) if isinstance(data, str) else json.loads(data.decode('utf-8'))
+        return None
+    except Exception as e:
+        add_log(f"⚠️ 订单缓存读取失败: {e}")
+        return None
+
+def clear_order_cache(username):
+    """清除订单缓存"""
+    try:
+        key = f"scut_order:cache:orders:{username}"
+        redis_client.delete(key)
+    except:
+        pass
+
+# === 场地缓存操作 (Redis Only) ===
+
+def save_venue_cache(cache_key, cache_data):
+    """保存场地缓存到 Redis"""
+    try:
+        key = f"scut_order:cache:venues:{cache_key}"
+        redis_client.set(key, json.dumps(cache_data, ensure_ascii=False), ex=CACHE_TTL)
+        return True
+    except Exception as e:
+        add_log(f"⚠️ 场地缓存保存失败: {e}")
+        return False
+
+def get_venue_cache(cache_key):
+    """从 Redis 获取场地缓存"""
+    try:
+        key = f"scut_order:cache:venues:{cache_key}"
+        data = redis_client.get(key)
+        if data:
+            return json.loads(data) if isinstance(data, str) else json.loads(data.decode('utf-8'))
+        return None
+    except Exception as e:
+        add_log(f"⚠️ 场地缓存读取失败: {e}")
+        return None
+
+# === 2FA Driver 管理 ===
+
+def save_pending_driver(username, driver):
+    """保存等待 2FA 的 driver，并关闭旧的"""
+    with DRIVER_MAP_LOCK:
+        # 关闭旧的 driver（如果存在）
+        if username in PENDING_DRIVERS:
+            old_data = PENDING_DRIVERS[username]
+            add_log(f"⚠️ [{username}] 检测到旧的 2FA driver，先关闭")
+            try:
+                old_driver = old_data.get('driver') if isinstance(old_data, dict) else old_data
+                close_driver(old_driver)
+            except Exception as e:
+                add_log(f"⚠️ 关闭旧 driver 失败: {e}")
+        
+        # 保存新的 driver
+        PENDING_DRIVERS[username] = {
+            "driver": driver,
+            "timestamp": time.time(),
+            "last_attempt": time.time()
+        }
+        add_log(f"🔐 [{username}] 2FA driver 已保存，将在 10 分钟后自动清理")
+
+def get_pending_driver(username):
+    """获取等待 2FA 的 driver"""
+    with DRIVER_MAP_LOCK:
+        data = PENDING_DRIVERS.get(username)
+        if data:
+            return data.get('driver') if isinstance(data, dict) else data
+        return None
+
+def remove_pending_driver(username):
+    """移除等待 2FA 的 driver"""
+    with DRIVER_MAP_LOCK:
+        return PENDING_DRIVERS.pop(username, None)
+
+def should_retry_2fa(username):
+    """检查是否应该重试 2FA（每小时一次）"""
+    with DRIVER_MAP_LOCK:
+        if username not in PENDING_DRIVERS:
+            return True  # 没有记录，可以尝试
+        
+        data = PENDING_DRIVERS[username]
+        last_attempt = data.get('last_attempt', 0)
+        # 距离上次尝试超过 1 小时
+        return (time.time() - last_attempt) > 3600
+
+def _cleanup_expired_drivers():
+    """后台线程：定期清理超时的 2FA driver"""
+    while True:
+        time.sleep(300)  # 每 5 分钟检查一次
+        now = time.time()
+        expired = []
+        
+        with DRIVER_MAP_LOCK:
+            for username, data in list(PENDING_DRIVERS.items()):
+                timestamp = data.get('timestamp', 0) if isinstance(data, dict) else 0
+                # 超过 10 分钟未处理
+                if now - timestamp > 600:
+                    expired.append(username)
+        
+        for username in expired:
+            add_log(f"⏱️ [Cleanup] {username} 的 2FA driver 已超时 (10分钟)，强制关闭")
+            with DRIVER_MAP_LOCK:
+                data = PENDING_DRIVERS.pop(username, None)
+                if data:
+                    try:
+                        driver = data.get('driver') if isinstance(data, dict) else data
+                        close_driver(driver)
+                    except Exception as e:
+                        add_log(f"⚠️ 清理 driver 失败: {e}")
+
+
+# === 兼容性保留 (已废弃，仅供过渡) ===
+# 以下变量和函数保留是为了兼容旧代码，新代码请使用上面的 Redis 函数
+USER_SESSIONS = {}  # [已废弃] 仅作为临时内存缓存
+SESSION_LOCK = threading.Lock()  # [已废弃] 仅作为兼容
+SESSION_FILE = "sessions.json"  # [已废弃] 不再使用
 
 def load_sessions_from_file():
-    """从文件加载 Session 数据"""
+    """[已废弃] 从文件加载 Session - 现在从 Redis 加载"""
     global USER_SESSIONS
-    import os
-    if os.path.exists(SESSION_FILE):
-        try:
-            with open(SESSION_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                with SESSION_LOCK:
-                    USER_SESSIONS = data
-                add_log(f"💾 已加载 {len(USER_SESSIONS)} 个缓存 Session")
-        except Exception as e:
-            add_log(f"⚠️ Session 文件加载失败: {e}")
+    try:
+        sessions = get_all_sessions()
+        if sessions:
+            with SESSION_LOCK:
+                USER_SESSIONS = sessions
+            add_log(f"💾 从 Redis 加载 {len(sessions)} 个用户会话")
+    except Exception as e:
+        add_log(f"⚠️ Session 加载失败: {e}")
 
 def save_sessions_to_file():
-    """保存 Session 数据到文件"""
-    try:
-        with SESSION_LOCK:
-            data = USER_SESSIONS.copy()
-        with open(SESSION_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        add_log(f"⚠️ Session 文件保存失败: {e}")
+    """[已废弃] 保存 Session 到文件 - 现在自动保存到 Redis"""
+    pass  # Redis 自动持久化，无需手动保存
 
 def save_session_to_redis(username, session_data):
-    """保存 SESSION 到 Redis（供 Celery worker 访问）"""
-    try:
-        # 简化 cookies：移除不必要的字段
-        simplified_data = session_data.copy()
-        if 'cookies' in simplified_data and isinstance(simplified_data['cookies'], dict):
-            # 移除 my_client_ticket
-            cookies_copy = simplified_data['cookies'].copy()
-            cookies_copy.pop('my_client_ticket', None)
-            simplified_data['cookies'] = cookies_copy
-        
-        redis_client.set(
-            f"user_session:{username}",
-            json.dumps(simplified_data),
-            ex=86400  # 24小时过期
-        )
-    except Exception as e:
-        add_log(f"⚠️ Redis SESSION 保存失败: {e}")
+    """[已废弃] 请使用 save_session()"""
+    return save_session(username, session_data)
 
 def get_session_from_redis(username):
-    """从 Redis 获取 SESSION"""
-    try:
-        data = redis_client.get(f"user_session:{username}")
-        if data:
-            if isinstance(data, bytes):
-                return json.loads(data.decode('utf-8'))
-            return json.loads(data)
-        return None
-    except Exception as e:
-        add_log(f"⚠️ Redis SESSION 读取失败: {e}")
-        return None
+    """[已废弃] 请使用 get_session()"""
+    return get_session(username)
+
 
 # --- 任务持久化 ---
 def save_task_to_redis(task_id, task_data):
@@ -349,34 +518,40 @@ def _auto_refresh_daemon():
             now = time.time()
             users_to_refresh = []
             
-            with SESSION_LOCK:
-                # 复制键列表，避免迭代时修改
-                for username, session in list(USER_SESSIONS.items()):
-                    last_up = session.get('last_updated', 0)
-                    # 默认策略：超过 45 分钟未更新 -> 触发主动重登
-                    # 只有保存了密码的用户才能自动续期
-                    if now - last_up > 2700 and session.get('password'):
-                        users_to_refresh.append((username, session.get('password')))
+            # 从 Redis 获取所有 Session
+            all_sessions = get_all_sessions()
+            for username, session in all_sessions.items():
+                # ✅ 新增：跳过正在等待 2FA 且未到重试时间（1小时）的用户
+                if not should_retry_2fa(username):
+                    continue  # 跳过，避免频繁触发 2FA
+                
+                last_up = session.get('last_updated', 0)
+                time_diff = now - last_up
+                # 默认策略：超过 45 分钟未更新 -> 触发主动重登
+                # 只有保存了密码的用户才能自动续期
+                if time_diff > 2700 and session.get('password'):
+                    users_to_refresh.append((username, session.get('password'), int(time_diff)))
             
-            for u, p in users_to_refresh:
+            for u, p, age_seconds in users_to_refresh:
                 # 检查白名单防止滥用
                 if not check_whitelist(u): continue
                 
-                add_log(f"⏰ [AutoRefresh] {u} 会话即将过期 (>45m)，执行主动续期...", username=u)
+                add_log(f"⏰ [AutoRefresh] {u} 会话已 {age_seconds//60} 分钟未更新，执行主动续期...", username=u)
                 
                 # 复用 deduplicated_login (带并发锁)
                 # 注意：这会启动浏览器，消耗资源
                 status, res = deduplicated_login(u, p)
                 
                 if status == "success":
-                   # deduplicated_login 内部已经更新了 USER_SESSIONS
-                   # 这里只需同步到 Redis (deduplicated_login 只更新了内存)
-                   with SESSION_LOCK:
-                       if u in USER_SESSIONS:
-                           save_session_to_redis(u, USER_SESSIONS[u])
-                   add_log(f"✅ [AutoRefresh] {u} 续期成功！Cookie已刷新。", username=u)
+                   # 验证 Redis 是否真的更新了
+                   updated_session = get_session(u)
+                   if updated_session:
+                       new_last_updated = updated_session.get('last_updated', 0)
+                       add_log(f"✅ [AutoRefresh] {u} 续期成功！Cookie已刷新 (新时间戳: {int(new_last_updated)})", username=u)
+                   else:
+                       add_log(f"⚠️ [AutoRefresh] {u} 续期成功但 Redis 读取失败", username=u)
                 elif status == "need_2fa":
-                   add_log(f"⚠️ [AutoRefresh] {u} 续期需要 2FA，放弃自动续期。", username=u)
+                   add_log(f"⚠️ [AutoRefresh] {u} 续期需要 2FA，已保存 driver，1小时后重试", username=u)
                 else:
                    add_log(f"⚠️ [AutoRefresh] {u} 续期失败: {res}", username=u)
                    
@@ -387,13 +562,18 @@ def _auto_refresh_daemon():
             add_log(f"❌ [AutoRefresh] 守护线程异常: {e}")
 
 def start_auto_refresh_daemon():
-    """启动 Session 自动保活线程"""
+    """启动 Session 自动保活线程和 2FA driver 清理线程"""
     global _auto_refresh_thread
     if _auto_refresh_thread is None or not _auto_refresh_thread.is_alive():
         _auto_refresh_stop.clear()
         _auto_refresh_thread = threading.Thread(target=_auto_refresh_daemon, daemon=True, name="SessionGuard")
         _auto_refresh_thread.start()
         add_log("🛡️ Session 自动保活服务已启动 (45m/check)")
+    
+    # ✅ 启动 2FA driver 清理线程
+    cleanup_thread = threading.Thread(target=_cleanup_expired_drivers, daemon=True, name="DriverCleanup")
+    cleanup_thread.start()
+    add_log("🧹 2FA Driver 清理服务已启动 (10m 超时)")
 
 def stop_auto_refresh_daemon():
     _auto_refresh_stop.set()
@@ -847,15 +1027,17 @@ def execute_login_logic(username, password, driver=None):
             # --- 获取浏览器使用的UA ---
             user_agent = getattr(driver, '_user_agent', None)
             
-            # --- 保存会话信息 (新增) ---
-            with SESSION_LOCK:
-                USER_SESSIONS[username] = {
-                    "token": token,
-                    "cookies": cookies,
-                    "password": password, # 保存密码用于救援
-                    "user_agent": user_agent,  # 保存UA用于续订
-                    "last_updated": time.time()
-                }
+            # --- 保存会话信息到 Redis (合并原有数据，避免覆盖 email 等字段) ---
+            existing = get_session(username) or {}
+            session_data = {
+                **existing,  # 保留原有字段（如 email）
+                "token": token,
+                "cookies": cookies,
+                "password": password, # 保存密码用于救援
+                "user_agent": user_agent,  # 保存UA用于续订
+                "last_updated": time.time()
+            }
+            save_session(username, session_data)
             
             return "success", {"token": token, "cookies": cookies, "user_agent": user_agent}
 
@@ -864,8 +1046,7 @@ def execute_login_logic(username, password, driver=None):
         try:
             if len(driver.find_elements(By.ID, "PM1")) > 0:
                 add_log(f"🔐 [{username}] 检测到二次验证界面，等待用户输入验证码...")
-                with DRIVER_MAP_LOCK: 
-                    PENDING_DRIVERS[username] = driver
+                save_pending_driver(username, driver)  # ✅ 使用新函数（会关闭旧 driver）
                 return "need_2fa", "等待验证码"
         except Exception as e2fa_err:
             add_log(f"⚠️ [{username}] 2FA检测异常: {e2fa_err}")
@@ -1033,10 +1214,8 @@ def fetch_orders_internal(token, status_value, page=1, page_size=10, cookies=Non
         if resp.status_code == 200 and ("<html" in resp.text.lower() or "doctype html" in resp.text.lower()):
             if username:
                 add_log(f"⚠️ [{username}] 查看订单时 Session 失效，触发自动救援.")
-                pwd = None
-                with SESSION_LOCK:
-                    if username in USER_SESSIONS:
-                        pwd = USER_SESSIONS[username].get("password")
+                session = get_session(username)
+                pwd = session.get('password') if session else None
 
                 if pwd:
                     add_log(f"🔄 正在后台重新登录 {username}.")
@@ -1045,12 +1224,12 @@ def fetch_orders_internal(token, status_value, page=1, page_size=10, cookies=Non
                         new_token = res["token"]
                         new_cookies = res["cookies"]
 
-                        # 更新缓存
-                        with SESSION_LOCK:
-                            if username in USER_SESSIONS:
-                                USER_SESSIONS[username]["token"] = new_token
-                                USER_SESSIONS[username]["cookies"] = new_cookies
-                                USER_SESSIONS[username]["last_updated"] = time.time()
+                        # 更新到 Redis
+                        existing = get_session(username) or {}
+                        existing['token'] = new_token
+                        existing['cookies'] = new_cookies
+                        existing['last_updated'] = time.time()
+                        save_session(username, existing)
 
                         # 重试请求
                         resp = _do_request(new_token, new_cookies)
@@ -1140,16 +1319,11 @@ def fetch_venue_data(token, date_str, cookies=None, username=None, user_agent=No
                 try:
                     add_log(f"⚠️ [{username}] Token失效，触发自动救援...")
                     
-                    # 优先从 Redis 获取密码（Celery worker 可访问）
+                    # 优先从 Redis 获取密码
                     pwd = None
-                    session = get_session_from_redis(username)
+                    session = get_session(username)
                     if session:
                         pwd = session.get('password')
-                    else:
-                        # 备用：从 USER_SESSIONS 读取
-                        with SESSION_LOCK:
-                            if username in USER_SESSIONS:
-                                pwd = USER_SESSIONS[username].get('password')
                     
                     if pwd:
                         add_log(f"🔄 正在后台重新登录 {username}...")
@@ -1160,15 +1334,7 @@ def fetch_venue_data(token, date_str, cookies=None, username=None, user_agent=No
                             new_token = res['token']
                             new_cookies = res['cookies']
                             
-                            # 更新全局缓存
-                            with SESSION_LOCK:
-                                if username in USER_SESSIONS:
-                                    USER_SESSIONS[username]['token'] = new_token
-                                    USER_SESSIONS[username]['cookies'] = new_cookies
-                                    USER_SESSIONS[username]['last_updated'] = time.time()
-                                    
-                                    # 同时保存到 Redis
-                                    save_session_to_redis(username, USER_SESSIONS[username])
+                            # deduplicated_login 内部已更新 Redis，此处无需重复操作
                             
                             add_log("✅ 救援成功！使用新凭证重试请求...")
                             # 使用新凭证重试
@@ -1289,10 +1455,8 @@ def try_rescue_token(username, reason="unknown"):
         
     add_log(f"🚑 [{username}] 触发自动救援 (原因: {reason})...")
     
-    pwd = None
-    with SESSION_LOCK:
-        if username in USER_SESSIONS:
-            pwd = USER_SESSIONS[username].get('password')
+    session = get_session(username)
+    pwd = session.get('password') if session else None
             
     if not pwd:
         add_log(f"❌ [{username}] 无法救援: 缺少保存的密码")
@@ -1306,7 +1470,7 @@ def try_rescue_token(username, reason="unknown"):
         new_token = res['token']
         new_cookies = res['cookies']
         
-        #execute_login_logic 内部已经更新了 USER_SESSIONS，所以这里不需要再手动更新
+        # execute_login_logic 内部已经更新了 Redis
         add_log(f"✅ [{username}] 救援成功！")
         return True
     else:

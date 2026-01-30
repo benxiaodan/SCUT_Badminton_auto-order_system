@@ -7,8 +7,15 @@ from core import (
     add_log, redis_client, execute_login_logic, deduplicated_login, fetch_venue_data, 
     extract_user_info, check_whitelist, PENDING_DRIVERS, DRIVER_MAP_LOCK,
     close_driver, sniff_token, fetch_orders_internal, send_booking_request,
-    kill_zombie_processes, USER_SESSIONS, SESSION_LOCK, check_token_validity,
-    load_sessions_from_file, save_sessions_to_file, save_session_to_redis, get_session_from_redis,
+    kill_zombie_processes, check_token_validity,
+    # 新版 Redis 函数 (唯一数据源)
+    save_session, get_session, get_all_sessions, update_session_field,
+    save_order_cache, get_order_cache, clear_order_cache,
+    save_venue_cache, get_venue_cache,
+    # 兼容性保留 (已废弃)
+    USER_SESSIONS, SESSION_LOCK, load_sessions_from_file, save_sessions_to_file,
+    save_session_to_redis, get_session_from_redis,
+    # 任务相关
     save_task_to_redis, remove_task_from_redis, load_all_tasks_from_redis,
     send_lock_failed_email, send_email_notification, start_health_check_daemon, start_auto_refresh_daemon
 )
@@ -24,22 +31,17 @@ app = FastAPI()
 TASK_LOCK = threading.Lock()
 TASK_MANAGER = {}  # {task_id: {"type": "lock/snipe", "status": "xxx", "stop_event": Event, "info": "xxx"}}
 
-# --- 数据缓存 ---
-ORDER_CACHE = {}  # {username: {status_type: {data, timestamp}}}
-VENUE_CACHE = {}  # {token: {data, timestamp}}
-CACHE_TIMEOUT = 300  # 5分钟缓存
-
-def is_cache_valid(cache_entry):
-    """检查缓存是否有效"""
-    if not cache_entry:
-        return False
-    return time.time() - cache_entry.get('timestamp', 0) < CACHE_TIMEOUT
+# --- 数据缓存 (已废弃，保留兼容) ---
+# 注意：现在所有缓存都通过 Redis 操作，以下变量仅作为临时过渡
+# ORDER_CACHE = {}  # [已废弃] 使用 get_order_cache() / save_order_cache()
+# VENUE_CACHE = {}  # [已废弃] 使用 get_venue_cache() / save_venue_cache()
+CACHE_TIMEOUT = 300  # 5分钟缓存 (用于 Redis TTL)
 
 @app.on_event("startup")
 async def startup_event():
     """服务启动时执行"""
-    # 加载 Session 缓存
-    load_sessions_from_file()
+    # Redis 是唯一数据源，启动时日志提示
+    add_log("💾 Redis 作为唯一数据源，系统已启动")
     
     # 尝试从 Redis 恢复任务状态 (仅展示)
     try:
@@ -73,6 +75,7 @@ async def startup_event():
     start_health_check_daemon()
     start_auto_refresh_daemon()
     add_log("🛡️ 浏览器僵尸进程守护已启动")
+
 
 # --- CORS ---
 app.add_middleware(
@@ -122,26 +125,12 @@ async def login(request: Request):
         add_log(f"{username} 用户正在登录中，请等待...", username=username)
         
     
-        # 1. 检查缓存 (内存 -> Redis)
-        print(f">>> [DEBUG] 开始检查缓存: {username}", flush=True)
+        # 1. 检查 Redis 缓存 (唯一数据源)
+        print(f">>> [DEBUG] 开始检查 Redis 缓存: {username}", flush=True)
         
-        cached = None
-        with SESSION_LOCK:
-            if username in USER_SESSIONS:
-                cached = USER_SESSIONS[username]
-                print(f">>> [DEBUG] 内存缓存命中", flush=True)
-        
-        # 如果内存没有，尝试从 Redis 获取 (跨进程/重启后恢复)
-        if not cached:
-            try:
-                cached = get_session_from_redis(username)
-                if cached:
-                    print(f">>> [DEBUG] Redis 缓存命中", flush=True)
-                    # 同步回内存
-                    with SESSION_LOCK:
-                        USER_SESSIONS[username] = cached
-            except Exception as e:
-                print(f">>> [DEBUG] Redis 读取出错: {e}", flush=True)
+        cached = get_session(username)  # 直接从 Redis 获取
+        if cached:
+            print(f">>> [DEBUG] Redis 缓存命中", flush=True)
 
         if cached:
             # 只有当密码匹配时才复用 (防止账号被盗用缓存)
@@ -157,7 +146,6 @@ async def login(request: Request):
                     print(f">>> [DEBUG] Token check passed for {username}", flush=True)
                     try:
                         add_log(f"⚡ [{username}] 使用缓存 Token 秒登成功", username=username)
-                        save_sessions_to_file()  # 保存会话
                         print(f">>> [DEBUG] Returning success for {username}", flush=True)
                         return {"status": "success", "token": token}
                     except Exception as e:
@@ -169,14 +157,16 @@ async def login(request: Request):
             else:
                 print(f">>> [DEBUG] 缓存存在但密码不匹配", flush=True)
         else:
-            print(f">>> [DEBUG] 无此用户缓存 (内存 & Redis)", flush=True)
+            print(f">>> [DEBUG] Redis 无此用户缓存", flush=True)
         
         # 2. 如果缓存无或无效，执行 Selenium 登录
         print(f">>> [DEBUG] 开始 Selenium 登录流程...", flush=True)
-        with DRIVER_MAP_LOCK:
-            if username in PENDING_DRIVERS:
-                close_driver(PENDING_DRIVERS[username])
-                del PENDING_DRIVERS[username]
+        # 清理旧的 2FA driver（如果存在）
+        from core import get_pending_driver, remove_pending_driver
+        old_driver = get_pending_driver(username)
+        if old_driver:
+            close_driver(old_driver)
+            remove_pending_driver(username)
 
         loop = asyncio.get_event_loop()
         status, result = await loop.run_in_executor(None, deduplicated_login, username, password)
@@ -189,25 +179,18 @@ async def login(request: Request):
                 cookies = result['cookies']
                 user_agent = result.get('user_agent')  # 获取UA
                 
-                # 登录成功，更新缓存
-                with SESSION_LOCK:
-                    USER_SESSIONS[username] = {
-                        "password": password,
-                        "email": email,
-                        "token": token,
-                        "cookies": cookies,
-                        "user_agent": user_agent,  # 保存UA
-                        "last_updated": time.time()
-                    }
-                
-                # 同时保存到 Redis
-                try:
-                    save_session_to_redis(username, USER_SESSIONS[username])
-                except Exception as e:
-                    print(f">>> [DEBUG] Redis save error: {e}", flush=True)
+                # 登录成功，直接保存到 Redis (唯一数据源)
+                session_data = {
+                    "password": password,
+                    "email": email,
+                    "token": token,
+                    "cookies": cookies,
+                    "user_agent": user_agent,  # 保存UA
+                    "last_updated": time.time()
+                }
+                save_session(username, session_data)
                 
                 response_data = {"status": "success", "token": token}
-                save_sessions_to_file()  # 保存会话
                 add_log(f"欢迎 {username} 用户使用本系统", username=username)
 
                 # --- 保存成功账号 ---
@@ -252,15 +235,16 @@ async def login(request: Request):
             # 这里不要再次赋值，否则会用字符串 "等待验证码" 覆盖 driver 对象！
             print(f">>> [DEBUG] 进入 need_2fa 分支", flush=True)
 
-            # 暂存凭证（用于 2FA 完成后写入 Session，及后续自动救援）
-            with SESSION_LOCK:
-                USER_SESSIONS[username] = {
-                    "password": password,
-                    "email": email,
-                    "token": USER_SESSIONS.get(username, {}).get("token"),
-                    "cookies": USER_SESSIONS.get(username, {}).get("cookies"),
-                    "last_updated": time.time()
-                }
+            # 暂存凭证到 Redis（用于 2FA 完成后写入 Session，及后续自动救援）
+            existing = get_session(username) or {}
+            session_data = {
+                "password": password,
+                "email": email,
+                "token": existing.get("token"),
+                "cookies": existing.get("cookies"),
+                "last_updated": time.time()
+            }
+            save_session(username, session_data)
 
             response_data = {"status": "need_2fa", "msg": "请输入验证码"}
             print(f">>> [DEBUG] 返回 need_2fa 响应: {response_data}", flush=True)
@@ -287,9 +271,9 @@ async def submit_2fa(request: Request):
     
     print(f">>> [DEBUG] 收到 2FA 验证码: username={username}, code={code}", flush=True)
     
-    driver = None
-    with DRIVER_MAP_LOCK:
-        driver = PENDING_DRIVERS.get(username)
+    # ✅ 使用新函数获取 driver
+    from core import get_pending_driver
+    driver = get_pending_driver(username)
     
     if not driver:
         return {"status": "error", "msg": "Session expired or browser closed"}
@@ -369,26 +353,21 @@ async def submit_2fa(request: Request):
                 add_log(f"⚠️ [{username}] Cookies 提取失败: {cookie_err}")
             
             close_driver(driver)
-            # 移除 pending
-            with DRIVER_MAP_LOCK:
-                if username in PENDING_DRIVERS:
-                    del PENDING_DRIVERS[username]
+            # 移除 pending (使用新函数)
+            from core import remove_pending_driver
+            remove_pending_driver(username)
             
-            # 更新 Session
-            from core import USER_SESSIONS, SESSION_LOCK, save_session_to_redis
-            with SESSION_LOCK:
-                USER_SESSIONS[username] = {
-                    "token": token,
-                    "cookies": cookies,
-                    "last_updated": time.time(),
-                    "password": USER_SESSIONS.get(username, {}).get("password"),
-                    "email": USER_SESSIONS.get(username, {}).get("email")
-                }
-            
-            # 同步到 Redis
-            try:
-                save_session_to_redis(username, USER_SESSIONS[username])
-            except: pass
+            # 更新 Session (保存到 Redis)
+            existing = get_session(username) or {}
+            session_data = {
+                "token": token,
+                "cookies": cookies,
+                "last_updated": time.time(),
+                "password": existing.get("password"),
+                "email": existing.get("email"),
+                "user_agent": existing.get("user_agent")
+            }
+            save_session(username, session_data)
             
             add_log(f"🎉 [{username}] 验证成功，已登录")
             add_log(f"🔑 Token: {token[:50]}...")
@@ -403,16 +382,19 @@ async def submit_2fa(request: Request):
                 if token:
                     cookies = {c['name']: c['value'] for c in driver.get_cookies()}
                     close_driver(driver)
-                    with DRIVER_MAP_LOCK:
-                        if username in PENDING_DRIVERS:
-                            del PENDING_DRIVERS[username]
-                    with SESSION_LOCK:
-                        USER_SESSIONS[username] = {
-                            "token": token, "cookies": cookies,
-                            "last_updated": time.time(),
-                            "password": USER_SESSIONS.get(username, {}).get("password"),
-                            "email": USER_SESSIONS.get(username, {}).get("email")
-                        }
+                    # 移除 pending (使用新函数)
+                    from core import remove_pending_driver
+                    remove_pending_driver(username)
+                    # 保存到 Redis
+                    existing = get_session(username) or {}
+                    session_data = {
+                        "token": token, "cookies": cookies,
+                        "last_updated": time.time(),
+                        "password": existing.get("password"),
+                        "email": existing.get("email"),
+                        "user_agent": existing.get("user_agent")
+                    }
+                    save_session(username, session_data)
                     add_log(f"🎉 [{username}] 刷新后获取 Token 成功")
                     return {"status": "success", "token": token}
             except Exception as refresh_err:
@@ -446,11 +428,12 @@ async def venues(token: str, username: str = None):
         
         cache_key = f"{username or token[:20]}"  # 保留 key 用于后续缓存更新
         
+        # 从 Redis 获取 cookies
         cookies = {}
         if username:
-            with SESSION_LOCK:
-                if username in USER_SESSIONS:
-                    cookies = USER_SESSIONS[username].get('cookies', {})
+            session = get_session(username)
+            if session:
+                cookies = session.get('cookies', {})
         
         print(f">>> [DEBUG] venues: username={username}, cookies count={len(cookies)}", flush=True)
 
@@ -510,11 +493,11 @@ async def venues(token: str, username: str = None):
 
         # add_log("✅ 场地数据查询成功")
         
-        # 更新缓存
-        VENUE_CACHE[cache_key] = {
+        # 更新缓存 (保存到 Redis)
+        save_venue_cache(cache_key, {
             'data': result,
             'timestamp': time.time()
-        }
+        })
         
         return result
     
@@ -545,20 +528,20 @@ async def get_orders(request: Request):
     if not token:
         return {"status": "error", "msg": "Missing token"}
 
-    # cookies 优先从会话缓存取
+    # cookies 优先从 Redis 会话获取
     cookies = {}
     if not username:
         u = extract_user_info(token)
         username = u.get('account') if u else None
     
     if username:
-        with SESSION_LOCK:
-            if username in USER_SESSIONS:
-                # 优先使用 SESSION 中最新的 token 和 cookies
-                stored_token = USER_SESSIONS[username].get('token')
-                if stored_token:
-                    token = stored_token
-                cookies = USER_SESSIONS[username].get('cookies', {}) or {}
+        session = get_session(username)  # 从 Redis 获取
+        if session:
+            # 优先使用 SESSION 中最新的 token 和 cookies
+            stored_token = session.get('token')
+            if stored_token:
+                token = stored_token
+            cookies = session.get('cookies', {}) or {}
 
     # 缓存键
     cache_key = username or f"tk:{str(token)[-16:]}"
@@ -567,10 +550,8 @@ async def get_orders(request: Request):
     # 是否强制刷新
     force_refresh = bool(data.get("refreshAll") or data.get("forceRefresh") or data.get("prefetchAll"))
 
-    # 如果缓存不存在或过期，则一次性抓取四种 status 并缓存
-    # 如果缓存不存在或过期，或者请求的是 'all' 且需要刷新，则一次性抓取四种 status 并缓存
-    # 注意：如果单纯请求 'all'，我们也强制刷新/检查所有状态
-    cache = ORDER_CACHE.get(cache_key)
+    # 从 Redis 获取缓存
+    cache = get_order_cache(cache_key) if not force_refresh else None
     need_refresh = force_refresh or (not cache) or (now - float(cache.get("updated_at", 0)) > CACHE_TIMEOUT)
     
     # 如果请求的是 'all'，我们必须确保缓存里有所有状态的数据
@@ -598,8 +579,9 @@ async def get_orders(request: Request):
             all_records.sort(key=lambda x: int(x.get("createdAtMs") or 0), reverse=True)
             by_status[st] = all_records
 
-        ORDER_CACHE[cache_key] = {"updated_at": now, "by_status": by_status}
-        cache = ORDER_CACHE[cache_key]
+        # 保存到 Redis 缓存
+        cache = {"updated_at": now, "by_status": by_status}
+        save_order_cache(cache_key, cache)
 
     # 返回目标 status 的分页数据
     if status_type == 'all':
@@ -610,14 +592,14 @@ async def get_orders(request: Request):
         status_name_map = {1: 'unpaid', 2: 'paid', 3: 'refund', 4: 'closed'}
         for st_code, recs in cache_data.items():
             for r in recs:
-                r['statusType'] = status_name_map.get(st_code, 'unknown')
+                r['statusType'] = status_name_map.get(int(st_code), 'unknown')
                 all_flattened.append(r)
         
         # 按时间倒序
         all_flattened.sort(key=lambda x: int(x.get("createdAtMs") or 0), reverse=True)
         return {"status": "success", "data": {"records": all_flattened}} # 复用 records 字段
 
-    records = (cache.get("by_status") or {}).get(target_status, []) or []
+    records = (cache.get("by_status") or {}).get(str(target_status), []) or (cache.get("by_status") or {}).get(target_status, []) or []
     page = data.get("page", 1)
     page_size = data.get("pageSize", 10)
     
@@ -654,15 +636,15 @@ async def book_direct(request: Request):
 
     account_name = username if username else user_info['account']
     
-    # 获取 cookies 和 UA
+    # 获取 cookies 和 UA (从 Redis)
     cookies = {}
     user_agent = None
-    with SESSION_LOCK:
-        if account_name in USER_SESSIONS:
-            if email:
-                USER_SESSIONS[account_name]['email'] = email
-            cookies = USER_SESSIONS[account_name].get('cookies', {})
-            user_agent = USER_SESSIONS[account_name].get('user_agent')
+    session = get_session(account_name)
+    if session:
+        if email:
+            update_session_field(account_name, 'email', email)
+        cookies = session.get('cookies', {})
+        user_agent = session.get('user_agent')
 
     add_log(f"⚡ [Direct] 尝试预定 {data['startTime']} 的场地...", username=account_name)
     ok, msg, _ = send_booking_request(
@@ -678,10 +660,8 @@ async def book_direct(request: Request):
         if email:
             send_email_notification(email, account_name, order_details)
         
-        # 清除订单缓存，强制重新查询
-        for key in list(ORDER_CACHE.keys()):
-            if account_name in key:
-                del ORDER_CACHE[key]
+        # 清除订单缓存 (从 Redis)
+        clear_order_cache(account_name)
     else:
         add_log(f"❌ 预定失败: {msg}", username=account_name)
 
@@ -723,16 +703,16 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
     4. 续订窗口为 60 秒
     5. 续订成功后更新 last_success_time，进入下一轮循环
     """
-    # 当前凭证（直接从 USER_SESSIONS 获取）
+    # 当前凭证（从 Redis 获取）
     current_token = token
     current_cookies = {}
     current_user_agent = None  # 保存用户的UA
     current_credential_timestamp = 0  # 🔑 跟踪当前凭证的时间戳，用于判断是否需要同步
-    with SESSION_LOCK:
-        if account_name in USER_SESSIONS:
-            current_cookies = USER_SESSIONS[account_name].get('cookies', {})
-            current_user_agent = USER_SESSIONS[account_name].get('user_agent')  # 获取登录时的UA
-            current_credential_timestamp = USER_SESSIONS[account_name].get('last_updated', 0)
+    session = get_session(account_name)
+    if session:
+        current_cookies = session.get('cookies', {})
+        current_user_agent = session.get('user_agent')  # 获取登录时的UA
+        current_credential_timestamp = session.get('last_updated', 0)
     
     info = f"[{account_name}] {date} {start_time} {venue_name}"
     
@@ -789,11 +769,12 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                 def _background_credential_refresh():
                     nonlocal current_token, current_cookies, current_user_agent, last_credential_refresh
                     
+                    # ✅ 修复作用域错误：在嵌套函数中显式导入
+                    from core import deduplicated_login
+                    
                     add_log(f"🔄 [Task {task_id}] 后台刷新凭证（已过 {int(time_since_refresh / 60)} 分钟）...", username=account_name)
-                    pwd = None
-                    with SESSION_LOCK:
-                        if account_name in USER_SESSIONS:
-                            pwd = USER_SESSIONS[account_name].get('password')
+                    session = get_session(account_name)
+                    pwd = session.get('password') if session else None
                     
                     if not pwd:
                         return
@@ -837,19 +818,18 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
             
             # === 阶段2：8分钟到9分50秒之间，验证Token并等待 ===
             if elapsed < RENEW_START_DELAY:
-                # 同步最新凭证 - 只在 USER_SESSIONS 确实有更新的凭证时才同步
+                # 同步最新凭证 - 从 Redis 获取，只在确实有更新的凭证时才同步
                 # 🔑 通过 last_updated 时间戳判断，避免用旧 cookies 覆盖刚刷新的新 cookies
-                with SESSION_LOCK:
-                    if account_name in USER_SESSIONS:
-                        cached = USER_SESSIONS[account_name]
-                        cached_updated = cached.get('last_updated', 0)
-                        # 只有当 USER_SESSIONS 中的凭证时间戳比当前的更新时才同步
-                        if cached_updated > current_credential_timestamp:
-                            current_token = cached['token']
-                            current_cookies = cached.get('cookies', {})
-                            current_user_agent = cached.get('user_agent')
-                            current_credential_timestamp = cached_updated  # 更新时间戳
-                            add_log(f"🔄 [Task {task_id}] 同步到新凭证 (ts: {int(cached_updated)})", username=account_name)
+                cached = get_session(account_name)
+                if cached:
+                    cached_updated = cached.get('last_updated', 0)
+                    # 只有当 Redis 中的凭证时间戳比当前的更新时才同步
+                    if cached_updated > current_credential_timestamp:
+                        current_token = cached['token']
+                        current_cookies = cached.get('cookies', {})
+                        current_user_agent = cached.get('user_agent')
+                        current_credential_timestamp = cached_updated  # 更新时间戳
+                        add_log(f"🔄 [Task {task_id}] 同步到新凭证 (ts: {int(cached_updated)})", username=account_name)
                 
                 # 主动验证token有效性（只在第一次验证）
                 if not token_verified:
@@ -860,13 +840,12 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                     else:
                         # Token失效，但fetch_venue_data已启动救援，同步最新凭证
                         add_log(f"⚠️ [Task {task_id}] Token验证失败，尝试同步救援后的凭证...", username=account_name)
-                        with SESSION_LOCK:
-                            if account_name in USER_SESSIONS:
-                                cached = USER_SESSIONS[account_name]
-                                current_token = cached.get('token', current_token)
-                                current_cookies = cached.get('cookies', current_cookies)
-                                current_user_agent = cached.get('user_agent', current_user_agent)
-                                add_log(f"🔄 [Task {task_id}] 已同步救援后的新凭证", username=account_name)
+                        cached = get_session(account_name)
+                        if cached:
+                            current_token = cached.get('token', current_token)
+                            current_cookies = cached.get('cookies', current_cookies)
+                            current_user_agent = cached.get('user_agent', current_user_agent)
+                            add_log(f"🔄 [Task {task_id}] 已同步救援后的新凭证", username=account_name)
                     token_verified = True
                 
                 # 🔑 检测 Cookie 是否即将过期，提前刷新凭证
@@ -881,10 +860,8 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                         # 如果 Cookie 距离过期不足 10 分钟，主动刷新
                         if time_until_cookie_exp < 600:
                             add_log(f"⚠️ [Task {task_id}] Cookie 即将过期 ({int(time_until_cookie_exp)}秒)，主动刷新凭证...", username=account_name)
-                            pwd = None
-                            with SESSION_LOCK:
-                                if account_name in USER_SESSIONS:
-                                    pwd = USER_SESSIONS[account_name].get('password')
+                            session = get_session(account_name)
+                            pwd = session.get('password') if session else None
                             if pwd:
                                 from core import deduplicated_login
                                 status, res = deduplicated_login(account_name, pwd)
@@ -930,10 +907,8 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                 add_log(f"⚠️ [Task {task_id}] 距上次刷新已超过55分钟，保守刷新凭证...", username=account_name)
             
             if cookie_about_to_expire:
-                pwd = None
-                with SESSION_LOCK:
-                    if account_name in USER_SESSIONS:
-                        pwd = USER_SESSIONS[account_name].get('password')
+                session = get_session(account_name)
+                pwd = session.get('password') if session else None
                 if pwd:
                     try:
                         status, res = deduplicated_login(account_name, pwd)
@@ -959,22 +934,20 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
             renew_start = time.time()
             round_success = False
             
+            # 🔑 续订前强制同步最新凭证（避免使用旧 cookie 导致续订失败）
+            # 因为 AutoRefresh 可能刚刚刷新了凭证，所以这里强制读取 Redis
+            cached = get_session(account_name)
+            if cached:
+                current_token = cached.get('token', current_token)
+                current_cookies = cached.get('cookies', current_cookies)
+                current_user_agent = cached.get('user_agent', current_user_agent)
+                current_credential_timestamp = cached.get('last_updated', current_credential_timestamp)
+                add_log(f"🔄 [Task {task_id}] 续订前同步最新凭证 (时间戳: {int(current_credential_timestamp)})", username=account_name)
+            
             # 续订窗口 60 秒
             while time.time() - renew_start < RENEW_WINDOW:
                 if stop_event.is_set(): 
                     return
-                
-                # 同步最新凭证 - 只在确实有更新时才同步
-                with SESSION_LOCK:
-                    if account_name in USER_SESSIONS:
-                        cached = USER_SESSIONS[account_name]
-                        cached_updated = cached.get('last_updated', 0)
-                        if cached_updated > current_credential_timestamp:
-                            current_token = cached['token']
-                            current_cookies = cached.get('cookies', {})
-                            current_user_agent = cached.get('user_agent')
-                            current_credential_timestamp = cached_updated
-                            add_log(f"🔄 [Task {task_id}] 同步到新凭证", username=account_name)
                 
                 # 发送续订请求（使用登录时的UA）
                 ok_renew, msg_renew, _ = send_booking_request(
@@ -991,10 +964,8 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                     # 🔑 续订后刷新: 如果之前标记了需要刷新（Cookie 有效期 3-14 分钟）
                     if need_refresh_after_renew:
                         add_log(f"🔄 [Task {task_id}] 续订成功，开始刷新 Cookie...", username=account_name)
-                        pwd = None
-                        with SESSION_LOCK:
-                            if account_name in USER_SESSIONS:
-                                pwd = USER_SESSIONS[account_name].get('password')
+                        session = get_session(account_name)
+                        pwd = session.get('password') if session else None
                         if pwd:
                             try:
                                 status, res = deduplicated_login(account_name, pwd)
@@ -1018,10 +989,8 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
             if not round_success and not stop_event.is_set():
                 # === 失败后立即尝试刷新凭证并重试 ===
                 add_log(f"⚠️ [Task {task_id}] 续订失败，尝试刷新凭证后重试...", username=account_name)
-                pwd = None
-                with SESSION_LOCK:
-                    if account_name in USER_SESSIONS:
-                        pwd = USER_SESSIONS[account_name].get('password')
+                session = get_session(account_name)
+                pwd = session.get('password') if session else None
                 
                 rescue_success = False
                 if pwd:
@@ -1093,11 +1062,11 @@ def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time
     current_cookies = {}
     current_user_agent = None
     
-    # 初始获取 Cookies 和 UA
-    with SESSION_LOCK:
-        if username in USER_SESSIONS:
-            current_cookies = USER_SESSIONS[username].get('cookies', {})
-            current_user_agent = USER_SESSIONS[username].get('user_agent')
+    # 初始获取 Cookies 和 UA (从 Redis)
+    session = get_session(username)
+    if session:
+        current_cookies = session.get('cookies', {})
+        current_user_agent = session.get('user_agent')
 
     with TASK_LOCK:
         if task_id in TASK_MANAGER:
@@ -1120,15 +1089,14 @@ def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time
         if stop_event.wait(timeout=1.5): # 1.5s 轮询间隔
             return
 
-        # 1. 获取最新凭证 (自动救援支持)
-        with SESSION_LOCK:
-            if username in USER_SESSIONS:
-                cached = USER_SESSIONS[username]
-                if cached.get('token') and cached.get('token') != current_token:
-                    current_token = cached['token']
-                    current_cookies = cached.get('cookies', {})
-                    current_user_agent = cached.get('user_agent')
-                    # add_log(f"🔄 [Task {task_id}] 同步新凭证", username=username)
+        # 1. 获取最新凭证 (从 Redis，自动救援支持)
+        cached = get_session(username)
+        if cached:
+            if cached.get('token') and cached.get('token') != current_token:
+                current_token = cached['token']
+                current_cookies = cached.get('cookies', {})
+                current_user_agent = cached.get('user_agent')
+                # add_log(f"🔄 [Task {task_id}] 同步新凭证", username=username)
 
         # 2. 查询场地
         try:
@@ -1174,9 +1142,8 @@ def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time
                 
                 # 发送通知
                 from core import send_email_notification
-                email = None
-                with SESSION_LOCK:
-                    email = USER_SESSIONS.get(username, {}).get('email')
+                session = get_session(username)
+                email = session.get('email') if session else None
                 if email:
                     order_details = f"任务ID: {task_id}\n捡漏成功: {v_name}\n日期: {date} {start_time}"
                     send_email_notification(email, username, order_details)
@@ -1246,13 +1213,13 @@ async def start_monitor(request: Request):
     
     # 情况1: 前端指定了具体场地 + 无限锁场
     if venue_id and is_lock_mode:
-        # 获取 cookies 和 UA
+        # 获取 cookies 和 UA (从 Redis)
         cookies = {}
         user_agent = None
-        with SESSION_LOCK:
-            if username in USER_SESSIONS:
-                cookies = USER_SESSIONS[username].get('cookies', {})
-                user_agent = USER_SESSIONS[username].get('user_agent')
+        session = get_session(username)
+        if session:
+            cookies = session.get('cookies', {})
+            user_agent = session.get('user_agent')
         
         # 先执行单次预定（使用登录时的UA）
         ok, msg, _ = send_booking_request(
