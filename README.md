@@ -60,7 +60,7 @@ sudo apt --fix-broken install -y
 # 查看 Chrome 版本
 google-chrome --version
 # 下载对应版本的 ChromeDriver（以下以 131 版本为例，请根据实际版本调整）
-wget https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.204/linux64/chromedriver-linux64.zip
+wget https://storage.googleapis.com/chrome-for-testing-public/144.0.7559.97/linux64/chromedriver-linux64.zip
 sudo apt install unzip -y
 unzip chromedriver-linux64.zip
 sudo mv chromedriver-linux64/chromedriver /usr/local/bin/

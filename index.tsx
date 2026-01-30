@@ -1248,9 +1248,9 @@ const MonthlyTaskCard = ({ task, onCancel }: { task: any, onCancel: () => void }
 const App = () => {
     const [view, setView] = useState<'login' | 'dashboard' | 'monthly'>('login');
 
-    const [username, setUsername] = useState('202421003514');
-    const [password, setPassword] = useState('20030611y$Y');
-    const [email, setEmail] = useState('1696725502@qq.com'); // 用户邮箱
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+    const [email, setEmail] = useState(''); // 用户邮箱
 
     const [status, setStatus] = useState<'idle' | 'checking' | '2fa_needed' | 'success' | 'error' | 'fetching_data' | 'reconnecting'>('idle');
     const [errorMsg, setErrorMsg] = useState('');
@@ -1628,21 +1628,16 @@ const App = () => {
             const data = await res.json();
 
             if (data.status === 'success') {
-                console.log("[DEBUG] Login successful, token received, switching to dashboard...");
-                // 1. 先更新Token
+                console.log("[DEBUG] Login successful, token received");
                 setToken(data.token);
-
-                // 2. 立即切换到 dashboard 视图
+                // 与 verify2FA 保持一致:先切换到dashboard,再获取数据
                 setView('dashboard');
                 setStatus('fetching_data');
-                console.log("[DEBUG] View set to dashboard, fetching venue data...");
-
                 try {
                     await fetchAllWeekData(data.token);
-                    console.log("[DEBUG] Venue data fetched successfully");
-                } catch (e) {
+                    console.log("[DEBUG] Successfully loaded venue data");
+                } catch (e: any) {
                     console.error("[DEBUG] Failed to fetch venue data:", e);
-                    // 即使获取数据失败，也保持在dashboard，用户可以手动刷新
                 }
             } else if (data.status === 'need_2fa') {
                 setStatus('2fa_needed');

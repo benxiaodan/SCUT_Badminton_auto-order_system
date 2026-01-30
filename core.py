@@ -1,4 +1,12 @@
-import os, time, datetime, random, re, subprocess, threading, requests, json, base64, smtplib, sys
+import os, time, datetime, random, re, subprocess, threading, requests, json, base64, smtplib, sys, shutil, atexit
+try:
+    from config import SMTP_SERVER, SMTP_PORT, SMTP_SENDER, SMTP_PASSWORD
+except ImportError:
+    # 配置文件不存在时使用环境变量或默认值
+    SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+    SMTP_SENDER = os.getenv("SMTP_SENDER", "")
+    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 from email.mime.text import MIMEText
 from email.header import Header
 from selenium import webdriver
@@ -190,10 +198,10 @@ def send_email_notification(receiver, account_name, order_info):
     if not receiver:
         return
 
-    smtp_server = "smtp.qq.com"
-    smtp_port = 465
-    sender = "1696725502@qq.com"
-    password = "voqujocowzfrccdh"  # 授权码
+    smtp_server = SMTP_SERVER
+    smtp_port = SMTP_PORT
+    sender = SMTP_SENDER
+    password = SMTP_PASSWORD
 
     subject = f'🏸 订场成功提醒：账号 {account_name} 需要付款'
 
@@ -223,10 +231,10 @@ def send_lock_failed_email(receiver, account_name, venue_name, fail_reason="未�
     if not receiver:
         return
 
-    smtp_server = "smtp.qq.com"
-    smtp_port = 465
-    sender = "1696725502@qq.com"
-    password = "voqujocowzfrccdh"  # 授权码
+    smtp_server = SMTP_SERVER
+    smtp_port = SMTP_PORT
+    sender = SMTP_SENDER
+    password = SMTP_PASSWORD
 
     subject = f'⚠️ 锁场失败警告：账号 {account_name} 场地已丢失'
 
@@ -270,8 +278,8 @@ def kill_zombie_processes():
 def process_health_check():
     """
     进程健康巡检：主动发现并清理不属于当前活跃列表的残留进程
+    支持 Windows 和 Linux
     """
-    # add_log("🔍 [HealthCheck] 启动进程健检...")
     try:
         if sys.platform == "win32":
             output = subprocess.check_output('tasklist /FI "IMAGENAME eq chromedriver.exe" /FO CSV /NH', shell=True).decode('gbk', errors='ignore')
@@ -280,30 +288,143 @@ def process_health_check():
                 if 'chromedriver.exe' in line:
                     parts = line.split(',')
                     if len(parts) > 1:
-                        pid = int(parts[1].strip('"'))
-                        with PID_LOCK:
-                            if pid not in ACTIVE_DRIVER_PIDS:
-                                # add_log(f"🗑️ [HealthCheck] 发现孤立进程 {pid}, 正在清理...")
-                                subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], capture_output=True)
-    except: pass
+                        try:
+                            pid = int(parts[1].strip('"'))
+                            with PID_LOCK:
+                                if pid not in ACTIVE_DRIVER_PIDS:
+                                    subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], capture_output=True)
+                        except ValueError:
+                            pass
+        else:
+            # Linux: 使用 pgrep 查找 chromedriver 进程
+            try:
+                output = subprocess.check_output(['pgrep', '-f', 'chromedriver'], text=True)
+                pids = [int(p.strip()) for p in output.strip().split('\n') if p.strip()]
+                for pid in pids:
+                    with PID_LOCK:
+                        if pid not in ACTIVE_DRIVER_PIDS:
+                            subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+            except subprocess.CalledProcessError:
+                pass  # 没有找到进程，正常情况
+    except Exception:
+        pass
 
-def init_browser():
-    """ 
-    工厂模式：每次调用返回全新的 driver 实例 
-    添加随机化指纹（User-Agent, 分辨率）和 Selenium 特征隐藏
+
+# 定期健康检查线程
+_health_check_thread = None
+_health_check_stop = threading.Event()
+
+def _health_check_daemon():
+    """后台线程：每 5 分钟执行一次进程健康检查"""
+    while not _health_check_stop.is_set():
+        _health_check_stop.wait(timeout=300)  # 5 分钟
+        if not _health_check_stop.is_set():
+            process_health_check()
+
+def start_health_check_daemon():
+    """启动后台健康检查线程（幂等，可多次调用）"""
+    global _health_check_thread
+    if _health_check_thread is None or not _health_check_thread.is_alive():
+        _health_check_stop.clear()
+        _health_check_thread = threading.Thread(target=_health_check_daemon, daemon=True, name="HealthCheckDaemon")
+        _health_check_thread.start()
+
+def stop_health_check_daemon():
+    """停止后台健康检查线程"""
+    _health_check_stop.set()
+
+
+# --- Session 自动保活 (Keep-Alive) ---
+_auto_refresh_thread = None
+_auto_refresh_stop = threading.Event()
+
+def _auto_refresh_daemon():
+    """后台线程：定期主动刷新 Session，防止 Cookie 过期"""
+    while not _auto_refresh_stop.is_set():
+        # 每 60 秒检查一次
+        _auto_refresh_stop.wait(60)
+        if _auto_refresh_stop.is_set(): break
+        
+        try:
+            now = time.time()
+            users_to_refresh = []
+            
+            with SESSION_LOCK:
+                # 复制键列表，避免迭代时修改
+                for username, session in list(USER_SESSIONS.items()):
+                    last_up = session.get('last_updated', 0)
+                    # 默认策略：超过 45 分钟未更新 -> 触发主动重登
+                    # 只有保存了密码的用户才能自动续期
+                    if now - last_up > 2700 and session.get('password'):
+                        users_to_refresh.append((username, session.get('password')))
+            
+            for u, p in users_to_refresh:
+                # 检查白名单防止滥用
+                if not check_whitelist(u): continue
+                
+                add_log(f"⏰ [AutoRefresh] {u} 会话即将过期 (>45m)，执行主动续期...", username=u)
+                
+                # 复用 deduplicated_login (带并发锁)
+                # 注意：这会启动浏览器，消耗资源
+                status, res = deduplicated_login(u, p)
+                
+                if status == "success":
+                   # deduplicated_login 内部已经更新了 USER_SESSIONS
+                   # 这里只需同步到 Redis (deduplicated_login 只更新了内存)
+                   with SESSION_LOCK:
+                       if u in USER_SESSIONS:
+                           save_session_to_redis(u, USER_SESSIONS[u])
+                   add_log(f"✅ [AutoRefresh] {u} 续期成功！Cookie已刷新。", username=u)
+                elif status == "need_2fa":
+                   add_log(f"⚠️ [AutoRefresh] {u} 续期需要 2FA，放弃自动续期。", username=u)
+                else:
+                   add_log(f"⚠️ [AutoRefresh] {u} 续期失败: {res}", username=u)
+                   
+                # 随机间隔，避免并发太高
+                time.sleep(random.randint(2, 5))
+                
+        except Exception as e:
+            add_log(f"❌ [AutoRefresh] 守护线程异常: {e}")
+
+def start_auto_refresh_daemon():
+    """启动 Session 自动保活线程"""
+    global _auto_refresh_thread
+    if _auto_refresh_thread is None or not _auto_refresh_thread.is_alive():
+        _auto_refresh_stop.clear()
+        _auto_refresh_thread = threading.Thread(target=_auto_refresh_daemon, daemon=True, name="SessionGuard")
+        _auto_refresh_thread.start()
+        add_log("🛡️ Session 自动保活服务已启动 (45m/check)")
+
+def stop_auto_refresh_daemon():
+    _auto_refresh_stop.set()
+
+
+# 注册进程退出时的清理函数
+def _cleanup_on_exit():
+    """进程退出时清理所有活跃的浏览器进程"""
+    stop_health_check_daemon()
+    stop_auto_refresh_daemon()
+    with PID_LOCK:
+        pids_to_kill = list(ACTIVE_DRIVER_PIDS)
+    
+    for pid in pids_to_kill:
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], capture_output=True, check=False)
+            else:
+                subprocess.run(["kill", "-9", str(pid)], capture_output=True, check=False)
+        except Exception:
+            pass
+
+atexit.register(_cleanup_on_exit)
+
+def _do_init_browser(selected_ua):
     """
-    add_log("🔧 [Init] 准备初始化浏览器...")
+    内部实现：实际启动浏览器的逻辑
+    返回 driver 或 None
+    """
     global DRIVER_PATH
     
-    # 候选 UA 列表
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-    ]
-    selected_ua = random.choice(USER_AGENTS)
-
     # 1. 驱动检查 - 优先使用系统常见路径
     if not DRIVER_PATH:
         # 优先检测自定义的 chromedriver-new
@@ -331,7 +452,6 @@ def init_browser():
         DRIVER_PATH = "chromedriver"
 
     # 2. 获取并发许可
-    # add_log("🌐 正在尝试启动浏览器...")
     acquired = BROWSER_SEMAPHORE.acquire(blocking=True, timeout=30)
     if not acquired:
         add_log("❌ 浏览器并发限制已达上限，请稍后再试")
@@ -341,11 +461,19 @@ def init_browser():
     if os.environ.get("HEADLESS", "true").lower() != "false":
         options.add_argument("--headless=new")
         
+    # 解决服务器环境下的启动问题
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--remote-debugging-port=0")
     options.add_argument(f"--user-agent={selected_ua}")
+    
+    # 设置临时用户数据目录（避免多实例冲突）
+    import tempfile
+    user_data_dir = tempfile.mkdtemp(prefix="chrome_")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
     
     # 隐藏 Selenium 特征
     options.add_argument("--disable-blink-features=AutomationControlled")
@@ -375,31 +503,103 @@ def init_browser():
         
         driver.set_page_load_timeout(30)
         
-        # 记录 PID
+        # 记录 PID 和临时目录
         pid = driver.service.process.pid
         driver._pid = pid
+        driver._user_agent = selected_ua  # 保存UA到driver对象
+        driver._user_data_dir = user_data_dir  # 保存临时目录用于清理
         with PID_LOCK: ACTIVE_DRIVER_PIDS.add(pid)
-        add_log(f"✅ 浏览器已启动 (PID: {pid})")
+        # add_log(f"✅ 浏览器已启动 (PID: {pid}, UA: {selected_ua[:50]}...)")
         
         return driver
 
     except Exception as e:
         add_log(f"❌ 浏览器启动失败: {e}")
+        # 清理临时目录
+        if user_data_dir and os.path.exists(user_data_dir):
+            shutil.rmtree(user_data_dir, ignore_errors=True)
         try: BROWSER_SEMAPHORE.release()
         except: pass
         return None
 
+
+def init_browser():
+    """ 
+    工厂模式：每次调用返回全新的 driver 实例 
+    添加随机化指纹（User-Agent, 分辨率）和 Selenium 特征隐藏
+    支持失败重试机制
+    """
+    # 候选 UA 列表
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    ]
+    selected_ua = random.choice(USER_AGENTS)
+    
+    # 最多尝试2次
+    for attempt in range(2):
+        if attempt == 0:
+            # add_log("🔧 [Init] 准备初始化浏览器...")
+            pass  # 首次尝试，静默启动
+        else:
+            add_log("🔄 [Init] 第二次尝试启动浏览器...")
+            # 重试前清理可能的僵尸进程
+            process_health_check()
+            time.sleep(1)
+        
+        driver = _do_init_browser(selected_ua)
+        if driver:
+            return driver
+    
+    # 两次都失败，执行强力清理后返回 None
+    add_log("❌ 浏览器启动失败（已重试），执行强力清理...")
+    kill_zombie_processes()
+    return None
+
 def close_driver(driver):
+    """安全关闭浏览器，清理相关资源"""
     if not driver: return
+    
+    pid = getattr(driver, '_pid', None)
+    user_data_dir = getattr(driver, '_user_data_dir', None)
+    
     try:
-        pid = getattr(driver, '_pid', None)
         driver.quit()
+    except Exception as e:
+        add_log(f"⚠️ Driver.quit() 失败: {e}")
+        # 强制杀进程作为后备
         if pid:
-            with PID_LOCK: ACTIVE_DRIVER_PIDS.discard(pid)
-    except: pass
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"], 
+                                   capture_output=True, check=False)
+                else:
+                    subprocess.run(["kill", "-9", str(pid)], 
+                                   capture_output=True, check=False)
+                add_log(f"🗑️ 强制终止进程 PID: {pid}")
+            except Exception as kill_err:
+                add_log(f"⚠️ 强制杀进程失败: {kill_err}")
     finally:
-        try: BROWSER_SEMAPHORE.release()
-        except: pass
+        # 1. 清理 PID 记录
+        if pid:
+            with PID_LOCK: 
+                ACTIVE_DRIVER_PIDS.discard(pid)
+        
+        # 2. 清理临时用户数据目录
+        if user_data_dir and os.path.exists(user_data_dir):
+            try:
+                shutil.rmtree(user_data_dir, ignore_errors=True)
+                # add_log(f"🧹 已清理临时目录: {user_data_dir}")
+            except Exception as rm_err:
+                pass  # 静默处理，避免日志刷屏
+        
+        # 3. 释放信号量
+        try:
+            BROWSER_SEMAPHORE.release()
+        except Exception:
+            pass  # 信号量可能已被释放
 
 
 def sniff_token(driver, timeout=0.5):
@@ -447,31 +647,70 @@ def extract_user_info(token):
 def check_and_click_campus_login(driver):
     """ 检测并点击'校内账号登录'按钮 """
     try:
-        # 查找包含特定文字的按钮或div
-        xpath = "//button[contains(., '校内账号登录')] | //div[contains(text(), '校内账号登录')]"
-        elems = driver.find_elements(By.XPATH, xpath)
-        for elem in elems:
-            if elem.is_displayed():
-#                add_log("👆 点击 '校内账号登录'...")
-                try:
-                    elem.click()
-                except:
-                    driver.execute_script("arguments[0].click();", elem)
-                return True
+        # 方式1: 查找包含特定文字的按钮或div
+        xpath_list = [
+            "//button[contains(., '校内账号登录')]",
+            "//div[contains(text(), '校内账号登录')]",
+            "//span[contains(text(), '校内账号登录')]",
+            "//a[contains(text(), '校内账号登录')]",
+            "//button[contains(., '校内登录')]",
+            "//div[contains(text(), '校内登录')]",
+            "//*[contains(@class, 'login') and contains(text(), '校内')]",
+        ]
+        
+        for xpath in xpath_list:
+            try:
+                elems = driver.find_elements(By.XPATH, xpath)
+                for elem in elems:
+                    if elem.is_displayed():
+                        # add_log(f"🔍 找到按钮: {elem.text[:20] if elem.text else 'no-text'}")
+                        try:
+                            elem.click()
+                        except:
+                            driver.execute_script("arguments[0].click();", elem)
+                        return True
+            except:
+                pass
 
-        # 备用：特定的CSS
+        # 方式2: 备用CSS选择器
+        css_selectors = [
+            "#root > div > div > div > div > div > div:nth-child(2) > button",
+            "button.campus-login",
+            "[class*='campus'][class*='login']",
+            "button:nth-child(2)",  # 通常是第二个按钮
+        ]
+        
+        for css in css_selectors:
+            try:
+                elem = driver.find_element(By.CSS_SELECTOR, css)
+                if elem.is_displayed():
+                    # add_log(f"🔍 通过CSS找到按钮: {css[:30]}")
+                    try:
+                        elem.click()
+                    except:
+                        driver.execute_script("arguments[0].click();", elem)
+                    return True
+            except:
+                pass
+
+        # 方式3: 遍历所有按钮，查找包含"校内"或"内"的
         try:
-            elem = driver.find_element(By.CSS_SELECTOR,
-                                       "#root > div > div > div > div > div > div:nth-child(2) > button")
-            if elem.is_displayed():
-#                add_log("👆 点击 '校内账号登录' (CSS)...")
-                elem.click()
-                return True
+            all_buttons = driver.find_elements(By.TAG_NAME, "button")
+            # add_log(f"🔍 页面上共有 {len(all_buttons)} 个按钮")
+            for btn in all_buttons:
+                btn_text = btn.text.strip() if btn.text else ""
+                if btn.is_displayed() and ("校内" in btn_text or "Campus" in btn_text.lower()):
+                    add_log(f"🔍 找到匹配按钮: {btn_text}")
+                    try:
+                        btn.click()
+                    except:
+                        driver.execute_script("arguments[0].click();", btn)
+                    return True
         except:
             pass
 
-    except:
-        pass
+    except Exception as e:
+        add_log(f"⚠️ 检测校内登录按钮异常: {e}")
     return False
 
 
@@ -558,7 +797,7 @@ def execute_login_logic(username, password, driver=None):
     - status: "error", result=msg
     """
     if not check_whitelist(username): return "error", "白名单拒绝"
-    add_log(f"🚀 [{username}] 启动智能登录 (60s超时)...")
+    # add_log(f"🚀 [{username}] 启动智能登录 (60s超时)...")
     
     if not driver:
         driver = init_browser()
@@ -566,11 +805,11 @@ def execute_login_logic(username, password, driver=None):
     
         if not driver: return "error", "浏览器启动失败"
     
-    add_log(f"🌐 [{username}] 浏览器就绪，正在打开登录页...")
+    # add_log(f"🌐 [{username}] 浏览器就绪，正在打开登录页...")
     # 确保打开页面
     if "venue" not in driver.current_url and "sso" not in driver.current_url:
         driver.get("https://venue.spe.scut.edu.cn/vb-user/login")
-    add_log(f"📄 当前页面标题: {driver.title}")
+    # add_log(f"📄 当前页面标题: {driver.title}")
 
     # 定义可能的账号密码框选择器 (包含 SCUT SSO 的常见ID)
     un_selectors = ["#un", "#username", "#account", "input[name='username']", "input[name='account']"]
@@ -592,13 +831,21 @@ def execute_login_logic(username, password, driver=None):
             # 稍作等待确保 Cookie 写入
             time.sleep(0.5) 
             cookies = {}
-            try:
-                cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                # add_log(f"🎉 [{username}] 成功获取 Token，🍪 捕获 Cookies ({len(cookies)})")
-            except:
-                pass
+            # 添加重试机制
+            for attempt in range(3):
+                try:
+                    time.sleep(0.3 * (attempt + 1))  # 递增延迟: 0.3s, 0.6s, 0.9s
+                    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+                    if cookies:  # 成功获取
+                        break
+                except Exception as e:
+                    if attempt == 2:  # 最后一次尝试失败
+                        add_log(f"⚠️ [{username}] Cookie获取失败（重试{attempt+1}次）: {e}")
             
             close_driver(driver)
+            
+            # --- 获取浏览器使用的UA ---
+            user_agent = getattr(driver, '_user_agent', None)
             
             # --- 保存会话信息 (新增) ---
             with SESSION_LOCK:
@@ -606,20 +853,24 @@ def execute_login_logic(username, password, driver=None):
                     "token": token,
                     "cookies": cookies,
                     "password": password, # 保存密码用于救援
+                    "user_agent": user_agent,  # 保存UA用于续订
                     "last_updated": time.time()
                 }
             
-            return "success", {"token": token, "cookies": cookies}
+            return "success", {"token": token, "cookies": cookies, "user_agent": user_agent}
 
         # 2. 检测 2FA 界面 (#PM1 是特定的验证码框ID)
+        # 直接进入验证码输入模式，让用户填写验证码
         try:
             if len(driver.find_elements(By.ID, "PM1")) > 0:
-                add_log(f"⚠️ [{username}] 检测到双重验证 (2FA) 界面，暂停等待输入...")
-                # 返回 Driver 实例以供后续 2FA 使用
-                with DRIVER_MAP_LOCK: PENDING_DRIVERS[username] = driver
+                add_log(f"🔐 [{username}] 检测到二次验证界面，等待用户输入验证码...")
+                with DRIVER_MAP_LOCK: 
+                    PENDING_DRIVERS[username] = driver
                 return "need_2fa", "等待验证码"
-        except:
+        except Exception as e2fa_err:
+            add_log(f"⚠️ [{username}] 2FA检测异常: {e2fa_err}")
             pass
+
 
         # 3. 页面动作 (每隔2秒执行一次，避免频繁操作)
         if time.time() - last_action_time < 2:
@@ -654,9 +905,9 @@ def execute_login_logic(username, password, driver=None):
             # 如果都填好了，点击登录
             # 重新获取值确认
             if un_elem.get_attribute('value') == username and pd_elem.get_attribute('value') == password:
-                add_log("🖱️ 凭证已填充，尝试点击登录按钮...")
+                # add_log("🖱️ 凭证已填充，尝试点击登录按钮...")
                 if click_login_btn(driver):
-                    add_log("⏳ 点击成功，等待页面跳转...")
+                    # add_log("⏳ 点击成功，等待页面跳转...")
                     time.sleep(2)
             continue
 
@@ -825,18 +1076,24 @@ def fetch_orders_internal(token, status_value, page=1, page_size=10, cookies=Non
         add_log(f"❌ 订单查询异常: {e}")
         return None
 
-def fetch_venue_data(token, date_str, cookies=None, username=None):
+def fetch_venue_data(token, date_str, cookies=None, username=None, user_agent=None):
     """
     使用 chaxun.txt 的逻辑进行数据查询，支持 Cookie 和 自动救援
+    参数:
+        cookies: 必须传入，学校后端同时验证 Token + Cookie
+        user_agent: 可选，传入特定UA以保持一致性
     """
     dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
     ts = int(dt.replace(hour=0,minute=0,second=0).timestamp() * 1000)
     url = "https://venue.spe.scut.edu.cn/api/pc/venue/pc/booking"
     
+    # 使用传入的UA或默认UA
+    ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+    
     headers = {
         "authorization": f"Bearer {token}",
         "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        "user-agent": ua,
         "origin": "https://venue.spe.scut.edu.cn",
         "referer": "https://venue.spe.scut.edu.cn/vb-user/booking"
     }
@@ -850,10 +1107,10 @@ def fetch_venue_data(token, date_str, cookies=None, username=None):
     }
 
     try:
-        # 1. 尝试第一次请求
-        print(f"DEBUG: fetch_venue_data calling requests.post... token={token[:10]}...", flush=True)
+        # 1. 尝试第一次请求（需要 Token + Cookie 同时验证）
+        # print(f"DEBUG: fetch_venue_data calling requests.post... token={token[:10]}...", flush=True)
         resp = requests.post(url, headers=headers, json=payload, cookies=cookies, timeout=8)
-        print(f"DEBUG: fetch_venue_data response: {resp.status_code}", flush=True)
+        # print(f"DEBUG: fetch_venue_data response: {resp.status_code}", flush=True)
         
         # 2. 核心救援逻辑：检测是否返回了 HTML (登录页)
         # 关键：检查 Content-Type 确保真的是 HTML 页面，避免误判
@@ -866,62 +1123,81 @@ def fetch_venue_data(token, date_str, cookies=None, username=None):
         
         if resp.status_code == 200 and is_html_page:
             if username:
-                add_log(f"⚠️ [{username}] Token失效，触发自动救援...")
+                # 使用锁防止多个请求同时触发救援
+                if not hasattr(fetch_venue_data, '_rescue_lock'):
+                    fetch_venue_data._rescue_lock = threading.Lock()
+                if not hasattr(fetch_venue_data, '_rescuing'):
+                    fetch_venue_data._rescuing = {}
                 
-                # 优先从 Redis 获取密码（Celery worker 可访问）
-                pwd = None
-                session = get_session_from_redis(username)
-                if session:
-                    pwd = session.get('password')
-                else:
-                    # 备用：从 USER_SESSIONS 读取
-                    with SESSION_LOCK:
-                        if username in USER_SESSIONS:
-                            pwd = USER_SESSIONS[username].get('password')
+                with fetch_venue_data._rescue_lock:
+                    if fetch_venue_data._rescuing.get(username):
+                        # 已有救援在进行，等待结果
+                        add_log(f"⏳ [{username}] 等待现有救援完成...")
+                        # 返回None让调用方使用缓存或稍后重试
+                        return None
+                    fetch_venue_data._rescuing[username] = True
                 
-                if pwd:
-                    add_log(f"🔄 正在后台重新登录 {username}...")
-                    # 重新执行登录 (使用并发控制)
-                    status, res = deduplicated_login(username, pwd)
+                try:
+                    add_log(f"⚠️ [{username}] Token失效，触发自动救援...")
                     
-                    if status == "success":
-                        new_token = res['token']
-                        new_cookies = res['cookies']
-                        
-                        # 更新全局缓存
+                    # 优先从 Redis 获取密码（Celery worker 可访问）
+                    pwd = None
+                    session = get_session_from_redis(username)
+                    if session:
+                        pwd = session.get('password')
+                    else:
+                        # 备用：从 USER_SESSIONS 读取
                         with SESSION_LOCK:
                             if username in USER_SESSIONS:
-                                USER_SESSIONS[username]['token'] = new_token
-                                USER_SESSIONS[username]['cookies'] = new_cookies
-                                USER_SESSIONS[username]['last_updated'] = time.time()
-                                
-                                # 同时保存到 Redis
-                                save_session_to_redis(username, USER_SESSIONS[username])
+                                pwd = USER_SESSIONS[username].get('password')
+                    
+                    if pwd:
+                        add_log(f"🔄 正在后台重新登录 {username}...")
+                        # 重新执行登录 (使用并发控制)
+                        status, res = deduplicated_login(username, pwd)
                         
-                        add_log("✅ 救援成功！使用新凭证重试请求...")
-                        # 使用新凭证重试
-                        headers["authorization"] = f"Bearer {new_token}"
-                        resp = requests.post(url, headers=headers, json=payload, cookies=new_cookies, timeout=8)
-                        
-                        # 立即解析结果
-                        if resp.status_code == 200:
-                            res_json = resp.json()
-                            if (res_json.get("code") == 1 or res_json.get("code") == 200) and "data" in res_json:
-                                return res_json["data"].get("venueSessionResponses", [])
-                    elif status == "need_2fa":
-                        # 新增：救援需要 2FA 验证，返回特殊标记让前端处理
-                        add_log(f"⚠️ [{username}] 救援需要 2FA 验证，等待用户输入...")
-                        return {"__need_rescue_2fa__": True, "username": username}
+                        if status == "success":
+                            new_token = res['token']
+                            new_cookies = res['cookies']
+                            
+                            # 更新全局缓存
+                            with SESSION_LOCK:
+                                if username in USER_SESSIONS:
+                                    USER_SESSIONS[username]['token'] = new_token
+                                    USER_SESSIONS[username]['cookies'] = new_cookies
+                                    USER_SESSIONS[username]['last_updated'] = time.time()
+                                    
+                                    # 同时保存到 Redis
+                                    save_session_to_redis(username, USER_SESSIONS[username])
+                            
+                            add_log("✅ 救援成功！使用新凭证重试请求...")
+                            # 使用新凭证重试
+                            headers["authorization"] = f"Bearer {new_token}"
+                            resp = requests.post(url, headers=headers, json=payload, cookies=new_cookies, timeout=8)
+                            
+                            # 立即解析结果
+                            if resp.status_code == 200:
+                                res_json = resp.json()
+                                if (res_json.get("code") == 1 or res_json.get("code") == 200) and "data" in res_json:
+                                    return res_json["data"].get("venueSessionResponses", [])
+                        elif status == "need_2fa":
+                            # 新增：救援需要 2FA 验证，返回特殊标记让前端处理
+                            add_log(f"⚠️ [{username}] 救援需要 2FA 验证，等待用户输入...")
+                            return {"__need_rescue_2fa__": True, "username": username}
+                        else:
+                            add_log(f"❌ 救援失败: {res}")
                     else:
-                        add_log(f"❌ 救援失败: {res}")
-                else:
-                    add_log("❌ 无法救援: 缺少保存的密码")
+                        add_log("❌ 无法救援: 缺少保存的密码")
+                finally:
+                    # 清除救援标记
+                    with fetch_venue_data._rescue_lock:
+                        fetch_venue_data._rescuing[username] = False
         
         # 3. 解析正常响应 (首次成功 或 重试成功)
         if resp.status_code == 200:
             try:
                 res_json = resp.json()
-                print(f"DEBUG: fetch_venue_data json: {str(res_json)[:100]}", flush=True)
+                # print(f"DEBUG: fetch_venue_data json: {str(res_json)[:100]}", flush=True)
                 if (res_json.get("code") == 1 or res_json.get("code") == 200) and "data" in res_json:
                     return res_json["data"].get("venueSessionResponses", [])
             except:
@@ -930,16 +1206,21 @@ def fetch_venue_data(token, date_str, cookies=None, username=None):
     except Exception as e:
         add_log(f"❌ 数据查询异常: {e}")
     return None
-def check_token_validity(token, cookies=None, username=None):
-    """检查 Token/Cookie 是否仍可用于获取订场数据（通过 booking 接口探测）。"""
+def check_token_validity(token, cookies=None, username=None, user_agent=None):
+    """
+    检查 Token + Cookie 是否仍可用于获取订场数据（通过 booking 接口探测）。
+    注意：学校后端同时验证 Token 和 Cookie，两者都需要有效
+    参数:
+        user_agent: 传入UA以保持与login时一致
+    """
     try:
         today = datetime.datetime.now().strftime("%Y-%m-%d")
-        sessions = fetch_venue_data(token, today, cookies, username=username)
+        sessions = fetch_venue_data(token, today, cookies, username=username, user_agent=user_agent)
         # fetch_venue_data 失败时返回 None
-        print(f"DEBUG: check_token_validity result: {sessions is not None}", flush=True)
+        # print(f"DEBUG: check_token_validity result: {sessions is not None}", flush=True)
         return sessions is not None
     except:
-        print("DEBUG: check_token_validity exception", flush=True)
+        # print("DEBUG: check_token_validity exception", flush=True)
         return False
 
 def get_booking_params(date_str):
@@ -950,14 +1231,22 @@ def get_booking_params(date_str):
     weekday = dt.isoweekday()
     return timestamp, weekday
 
-def send_booking_request(token, user_id, date_str, start_time, end_time, venue_id, price=40, stadium_id=1, cookies=None):
+def send_booking_request(token, user_id, date_str, start_time, end_time, venue_id, price=40, stadium_id=1, cookies=None, user_agent=None):
+    """
+    发送预定请求
+    注意：学校后端同时验证 Token + Cookie，必须传入 cookies
+    返回: (成功/失败, 消息, 新Cookie字典或None)
+    """
     belong_date, week = get_booking_params(date_str)
     url = "https://venue.spe.scut.edu.cn/api/pc/order/rental/orders/apply"
 
+    # 使用传入的UA，如果没有则使用默认值
+    ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+    
     headers = {
         "authorization": f"Bearer {token}",
         "content-type": "application/json",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        "user-agent": ua,
         "origin": "https://venue.spe.scut.edu.cn",
         "referer": "https://venue.spe.scut.edu.cn/vb-user/booking"
     }
@@ -978,16 +1267,18 @@ def send_booking_request(token, user_id, date_str, start_time, end_time, venue_i
     }
 
     try:
-        # 关键修复：带上 Cookies
+        # 必须同时使用 Token + Cookie（学校后端验证需要）
         resp = requests.post(url, headers=headers, json=payload, cookies=cookies, timeout=5)
         if resp.status_code == 200:
             res_json = resp.json()
             if res_json.get("code") == 200 or "成功" in str(res_json):
-                return True, "预定成功"
-            return False, res_json.get("msg", str(res_json))
-        return False, f"HTTP {resp.status_code}"
+                # 注意:学校后端在续订成功时不返回Set-Cookie头
+                # 只能通过定期重新登录来刷新Cookie
+                return True, "预定成功", None  # 第三个参数保持None
+            return False, res_json.get("msg", str(res_json)), None
+        return False, f"HTTP {resp.status_code}", None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 def try_rescue_token(username, reason="unknown"):
     """

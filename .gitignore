@@ -36,6 +36,8 @@ env/
 # Sensitive / User Data
 allowed_users.txt
 user_data.json
+config.py
+sessions.json
 brain/
 .gemini/
 .agent/

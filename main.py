@@ -10,7 +10,7 @@ from core import (
     kill_zombie_processes, USER_SESSIONS, SESSION_LOCK, check_token_validity,
     load_sessions_from_file, save_sessions_to_file, save_session_to_redis, get_session_from_redis,
     save_task_to_redis, remove_task_from_redis, load_all_tasks_from_redis,
-    send_lock_failed_email
+    send_lock_failed_email, send_email_notification, start_health_check_daemon, start_auto_refresh_daemon
 )
 from selenium.webdriver.common.by import By
 from monthly_booking import (
@@ -68,8 +68,11 @@ async def startup_event():
     except Exception as e:
         print(f"Failed to clear logs: {e}")
     
-    # 清理僵尸进程
+    # 清理僵尸进程并启动健康检查守护线程
     kill_zombie_processes()
+    start_health_check_daemon()
+    start_auto_refresh_daemon()
+    add_log("🛡️ 浏览器僵尸进程守护已启动")
 
 # --- CORS ---
 app.add_middleware(
@@ -146,9 +149,11 @@ async def login(request: Request):
                 print(f">>> [DEBUG] 凭证匹配，准备校验 Token...", flush=True)
                 token = cached.get('token')
                 cookies = cached.get('cookies')
+                user_agent = cached.get('user_agent')  # 获取缓存的UA
                 
                 # 优化：禁用自动救援 (username=None)，如果 Token 失效则直接产生 False，触发后续 Selenium 登录
-                if check_token_validity(token, cookies, username=None):
+                # 传入user_agent保持UA一致性
+                if check_token_validity(token, cookies, username=None, user_agent=user_agent):
                     print(f">>> [DEBUG] Token check passed for {username}", flush=True)
                     try:
                         add_log(f"⚡ [{username}] 使用缓存 Token 秒登成功", username=username)
@@ -179,9 +184,10 @@ async def login(request: Request):
         
         if status == "success":
             try:
-                # result 包含 token 和 cookies
+                # result 包含 token、cookies 和 user_agent
                 token = result['token']
                 cookies = result['cookies']
+                user_agent = result.get('user_agent')  # 获取UA
                 
                 # 登录成功，更新缓存
                 with SESSION_LOCK:
@@ -190,6 +196,7 @@ async def login(request: Request):
                         "email": email,
                         "token": token,
                         "cookies": cookies,
+                        "user_agent": user_agent,  # 保存UA
                         "last_updated": time.time()
                     }
                 
@@ -231,8 +238,8 @@ async def login(request: Request):
                 except Exception as e:
                     print(f"Failed to save account: {e}")
                 
-                print(f">>> [DEBUG] 返回成功响应: {response_data}", flush=True)
-                return JSONResponse(content=response_data)
+                print(f">>> [DEBUG] 返回成功响应: {{'status': 'success', 'token': token[:20] + '...'}}", flush=True)
+                return response_data
             except Exception as e:
                 print(f">>> [DEBUG] Post-login processing error: {e}", flush=True)
                 # 即使保存失败，只要有 Token 就让用户进
@@ -647,21 +654,22 @@ async def book_direct(request: Request):
 
     account_name = username if username else user_info['account']
     
-    # 获取 cookies
-    from core import send_email_notification
+    # 获取 cookies 和 UA
     cookies = {}
+    user_agent = None
     with SESSION_LOCK:
         if account_name in USER_SESSIONS:
             if email:
                 USER_SESSIONS[account_name]['email'] = email
             cookies = USER_SESSIONS[account_name].get('cookies', {})
+            user_agent = USER_SESSIONS[account_name].get('user_agent')
 
     add_log(f"⚡ [Direct] 尝试预定 {data['startTime']} 的场地...", username=account_name)
-    ok, msg = send_booking_request(
+    ok, msg, _ = send_booking_request(
         token, user_info['userId'],
         data['date'], data['startTime'], data['endTime'],
         data['venueId'], data.get('price', 40), data.get('stadiumId', 1),
-        cookies=cookies
+        cookies=cookies, user_agent=user_agent
     )
     
     if ok:
@@ -680,6 +688,29 @@ async def book_direct(request: Request):
     return {"status": "success" if ok else "error", "msg": msg}
 
 
+def get_cookie_exp_time(cookies):
+    """
+    解析 my_client_ticket Cookie 的过期时间戳
+    返回: Unix 时间戳 (秒) 或 None
+    """
+    try:
+        import base64
+        ticket = cookies.get('my_client_ticket')
+        if not ticket:
+            return None
+        parts = ticket.split('.')
+        if len(parts) < 2:
+            return None
+        # 解码 JWT payload
+        payload_b64 = parts[1]
+        # 添加 padding
+        payload_b64 += '=' * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get('exp')  # 返回过期时间戳
+    except Exception as e:
+        # 解析失败不影响主流程
+        return None
+
 def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time, 
                 venue_id, price, account_name, venue_name, email=None):
     """
@@ -695,9 +726,13 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
     # 当前凭证（直接从 USER_SESSIONS 获取）
     current_token = token
     current_cookies = {}
+    current_user_agent = None  # 保存用户的UA
+    current_credential_timestamp = 0  # 🔑 跟踪当前凭证的时间戳，用于判断是否需要同步
     with SESSION_LOCK:
         if account_name in USER_SESSIONS:
             current_cookies = USER_SESSIONS[account_name].get('cookies', {})
+            current_user_agent = USER_SESSIONS[account_name].get('user_agent')  # 获取登录时的UA
+            current_credential_timestamp = USER_SESSIONS[account_name].get('last_updated', 0)
     
     info = f"[{account_name}] {date} {start_time} {venue_name}"
     
@@ -707,15 +742,19 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
     
     # 续订计数器
     renew_count = 0
-    
+    token_verified = False
     # 🔑 关键：记录上次成功预定/续订的精确时间点
     last_success_time = time.time()
     add_log(f"🔒 [Task {task_id}] 锁场保活启动，基准时间: {datetime.datetime.now().strftime('%H:%M:%S')}", username=account_name)
 
     # 时间配置（秒）
     TOKEN_CHECK_DELAY = 8 * 60       # 8分钟后检测Token
-    RENEW_START_DELAY = 9 * 60 + 30  # 9分30秒后开始续订（10分钟到期前30秒，多留安全边际）
-    RENEW_WINDOW = 60                # 续订窗口60秒
+    RENEW_START_DELAY = 9 * 60 + 50  # 9分50秒后开始续订（10分钟到期前10秒）
+    RENEW_WINDOW = 30                # 续订窗口30秒（更精准）
+    CREDENTIAL_REFRESH_INTERVAL = 50 * 60  # 每50分钟主动刷新凭证
+    
+    # 记录上次凭证刷新时间
+    last_credential_refresh = time.time()
 
     try:
         while not stop_event.is_set():
@@ -726,10 +765,67 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                     add_log(f"⏰ [Task {task_id}] 已到达场地开始时间 ({date} {start_time})，任务自动结束", username=account_name)
                     stop_event.set()
                     break
-            except: pass
+            except Exception as e:
+                add_log(f"⚠️ [Task {task_id}] 无法解析场地时间，跳过自动停止检查: {e}", username=account_name)
 
-            # 计算距离上次成功的时间
+            # 🔑 关键:计算距离上次成功的时间(必须在使用前定义)
             elapsed = time.time() - last_success_time
+
+            # === 定时凭证刷新（每50分钟，智能避让续订窗口） ===
+            time_since_refresh = time.time() - last_credential_refresh
+            time_until_renew = RENEW_START_DELAY - elapsed
+            
+            # 只有满足以下条件才触发刷新：
+            # 1. 距上次刷新超过50分钟
+            # 2. 距下次续订超过2分钟（避让续订窗口）
+            # 3. 没有正在进行的后台刷新
+            should_refresh = (
+                time_since_refresh >= CREDENTIAL_REFRESH_INTERVAL and 
+                time_until_renew > 120  # 距续订超过2分钟
+            )
+            
+            if should_refresh:
+                # 使用后台线程异步刷新，不阻塞主循环
+                def _background_credential_refresh():
+                    nonlocal current_token, current_cookies, current_user_agent, last_credential_refresh
+                    
+                    add_log(f"🔄 [Task {task_id}] 后台刷新凭证（已过 {int(time_since_refresh / 60)} 分钟）...", username=account_name)
+                    pwd = None
+                    with SESSION_LOCK:
+                        if account_name in USER_SESSIONS:
+                            pwd = USER_SESSIONS[account_name].get('password')
+                    
+                    if not pwd:
+                        return
+                    
+                    try:
+                        status, res = deduplicated_login(account_name, pwd)
+                        if status == "success":
+                            # 更新凭证（线程安全：直接赋值是原子操作）
+                            current_token = res['token']
+                            current_cookies = res['cookies']
+                            current_user_agent = res.get('user_agent')
+                            last_credential_refresh = time.time()
+                            current_credential_timestamp = time.time()  # 🔑 更新凭证时间戳
+                            add_log(f"✅ [Task {task_id}] 后台凭证刷新成功！", username=account_name)
+                        elif status == "need_2fa":
+                            add_log(f"⚠️ [Task {task_id}] 刷新需要 2FA，跳过本次刷新", username=account_name)
+                            last_credential_refresh = time.time()  # 避免频繁尝试
+                        else:
+                            add_log(f"⚠️ [Task {task_id}] 后台刷新失败: {res}", username=account_name)
+                    except Exception as refresh_err:
+                        add_log(f"⚠️ [Task {task_id}] 后台刷新异常: {refresh_err}", username=account_name)
+                
+                # 启动后台线程
+                refresh_thread = threading.Thread(
+                    target=_background_credential_refresh, 
+                    name=f"CredentialRefresh-{task_id}",
+                    daemon=True
+                )
+                refresh_thread.start()
+                
+                # 立即更新刷新时间，避免重复触发
+                last_credential_refresh = time.time()
             
             # === 阶段1：等待到8分钟，期间响应停止信号 ===
             if elapsed < TOKEN_CHECK_DELAY:
@@ -739,24 +835,122 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                     return
                 continue
             
-            # === 阶段2：8分钟后同步凭证，等待续订时机 ===
+            # === 阶段2：8分钟到9分50秒之间，验证Token并等待 ===
             if elapsed < RENEW_START_DELAY:
-                # 同步最新凭证
+                # 同步最新凭证 - 只在 USER_SESSIONS 确实有更新的凭证时才同步
+                # 🔑 通过 last_updated 时间戳判断，避免用旧 cookies 覆盖刚刷新的新 cookies
                 with SESSION_LOCK:
                     if account_name in USER_SESSIONS:
                         cached = USER_SESSIONS[account_name]
-                        if cached.get('token') and cached.get('token') != current_token:
+                        cached_updated = cached.get('last_updated', 0)
+                        # 只有当 USER_SESSIONS 中的凭证时间戳比当前的更新时才同步
+                        if cached_updated > current_credential_timestamp:
                             current_token = cached['token']
                             current_cookies = cached.get('cookies', {})
-                            add_log(f"🔄 [Task {task_id}] 同步到新凭证", username=account_name)
+                            current_user_agent = cached.get('user_agent')
+                            current_credential_timestamp = cached_updated  # 更新时间戳
+                            add_log(f"🔄 [Task {task_id}] 同步到新凭证 (ts: {int(cached_updated)})", username=account_name)
+                
+                # 主动验证token有效性（只在第一次验证）
+                if not token_verified:
+                    add_log(f"🔍 [Task {task_id}] 开始验证Token有效性...", username=account_name)
+                    # 注意：这里传入username，启用自动救援
+                    if check_token_validity(current_token, current_cookies, username=account_name, user_agent=current_user_agent):
+                        add_log(f"✅ [Task {task_id}] Token验证通过，等待续订时机...", username=account_name)
+                    else:
+                        # Token失效，但fetch_venue_data已启动救援，同步最新凭证
+                        add_log(f"⚠️ [Task {task_id}] Token验证失败，尝试同步救援后的凭证...", username=account_name)
+                        with SESSION_LOCK:
+                            if account_name in USER_SESSIONS:
+                                cached = USER_SESSIONS[account_name]
+                                current_token = cached.get('token', current_token)
+                                current_cookies = cached.get('cookies', current_cookies)
+                                current_user_agent = cached.get('user_agent', current_user_agent)
+                                add_log(f"🔄 [Task {task_id}] 已同步救援后的新凭证", username=account_name)
+                    token_verified = True
+                
+                # 🔑 检测 Cookie 是否即将过期，提前刷新凭证
+                # 添加冷却检查：如果刚刚刷新过（距上次刷新不足5分钟），跳过本次检测
+                time_since_refresh = time.time() - last_credential_refresh
+                if time_since_refresh < 5 * 60:
+                    pass  # 刚刷新过，跳过 Cookie 过期检测
+                else:
+                    cookie_exp = get_cookie_exp_time(current_cookies)
+                    if cookie_exp:
+                        time_until_cookie_exp = cookie_exp - time.time()
+                        # 如果 Cookie 距离过期不足 10 分钟，主动刷新
+                        if time_until_cookie_exp < 600:
+                            add_log(f"⚠️ [Task {task_id}] Cookie 即将过期 ({int(time_until_cookie_exp)}秒)，主动刷新凭证...", username=account_name)
+                            pwd = None
+                            with SESSION_LOCK:
+                                if account_name in USER_SESSIONS:
+                                    pwd = USER_SESSIONS[account_name].get('password')
+                            if pwd:
+                                from core import deduplicated_login
+                                status, res = deduplicated_login(account_name, pwd)
+                                if status == "success":
+                                    current_token = res['token']
+                                    # 🔑 关键修复:立即同步新Cookie到current_cookies
+                                    current_cookies = res['cookies']
+                                    current_user_agent = res.get('user_agent')
+                                    last_credential_refresh = time.time()  # 更新刷新时间！
+                                    current_credential_timestamp = time.time()  # 🔑 更新凭证时间戳，防止被旧值覆盖
+                                    add_log(f"✅ [Task {task_id}] 凭证刷新成功！Cookie 有效期已续期", username=account_name)
+                                else:
+                                    add_log(f"❌ [Task {task_id}] 凭证刷新失败: {res}", username=account_name)
+                            else:
+                                add_log(f"❌ [Task {task_id}] 无法刷新: 缺少保存的密码", username=account_name)
                 
                 wait_time = min(RENEW_START_DELAY - elapsed, 10)
                 if stop_event.wait(timeout=wait_time):
                     add_log(f"⏹️ [Task {task_id}] 检测到停止信号", username=account_name)
                     return
                 continue
+
+            # === 阶段3：9分50秒后开始续订（到期前10秒） ===
             
-            # === 阶段3：9分55秒后开始续订（到期前5秒） ===
+            # 🔒 续订前检查 Cookie 有效期
+            # 策略: <3分钟先刷新, 3-14分钟续订后刷新, >14分钟正常续订
+            cookie_exp = get_cookie_exp_time(current_cookies)
+            cookie_about_to_expire = False
+            need_refresh_after_renew = False  # 标记是否需要续订后刷新
+            
+            if cookie_exp:
+                time_until_cookie_exp = cookie_exp - time.time()
+                if time_until_cookie_exp < 180:  # 距过期不足3分钟，必须先刷新
+                    cookie_about_to_expire = True
+                    add_log(f"⚠️ [Task {task_id}] Cookie 有效期不足（{int(time_until_cookie_exp)}秒 < 3分钟），先刷新再续订...", username=account_name)
+                elif time_until_cookie_exp <= 840:  # 3-14分钟，标记续订后刷新
+                    need_refresh_after_renew = True
+                    add_log(f"📋 [Task {task_id}] Cookie 有效期 {int(time_until_cookie_exp)}秒（3-14分钟），续订后刷新", username=account_name)
+            
+            # 即使无法解析过期时间，也检查距上次刷新是否超过55分钟
+            if not cookie_exp and (time.time() - last_credential_refresh) > 55 * 60:
+                cookie_about_to_expire = True
+                add_log(f"⚠️ [Task {task_id}] 距上次刷新已超过55分钟，保守刷新凭证...", username=account_name)
+            
+            if cookie_about_to_expire:
+                pwd = None
+                with SESSION_LOCK:
+                    if account_name in USER_SESSIONS:
+                        pwd = USER_SESSIONS[account_name].get('password')
+                if pwd:
+                    try:
+                        status, res = deduplicated_login(account_name, pwd)
+                        if status == "success":
+                            current_token = res['token']
+                            current_cookies = res['cookies']
+                            current_user_agent = res.get('user_agent')
+                            last_credential_refresh = time.time()
+                            current_credential_timestamp = time.time()  # 🔑 更新凭证时间戳
+                            add_log(f"✅ [Task {task_id}] 续订前凭证刷新成功！", username=account_name)
+                        elif status == "need_2fa":
+                            add_log(f"⚠️ [Task {task_id}] 刷新需要 2FA，使用现有凭证尝试续订", username=account_name)
+                        else:
+                            add_log(f"⚠️ [Task {task_id}] 续订前刷新失败: {res}，使用现有凭证尝试", username=account_name)
+                    except Exception as pre_refresh_err:
+                        add_log(f"⚠️ [Task {task_id}] 续订前刷新异常: {pre_refresh_err}", username=account_name)
+            
             add_log(f"⚡ [Task {task_id}] 开始续订 (距上次成功 {int(elapsed)}秒)", username=account_name)
             with TASK_LOCK:
                 if task_id in TASK_MANAGER:
@@ -770,19 +964,22 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                 if stop_event.is_set(): 
                     return
                 
-                # 同步最新凭证
+                # 同步最新凭证 - 只在确实有更新时才同步
                 with SESSION_LOCK:
                     if account_name in USER_SESSIONS:
                         cached = USER_SESSIONS[account_name]
-                        if cached.get('token') and cached.get('token') != current_token:
+                        cached_updated = cached.get('last_updated', 0)
+                        if cached_updated > current_credential_timestamp:
                             current_token = cached['token']
                             current_cookies = cached.get('cookies', {})
+                            current_user_agent = cached.get('user_agent')
+                            current_credential_timestamp = cached_updated
                             add_log(f"🔄 [Task {task_id}] 同步到新凭证", username=account_name)
                 
-                # 发送续订请求
-                ok_renew, msg_renew = send_booking_request(
+                # 发送续订请求（使用登录时的UA）
+                ok_renew, msg_renew, _ = send_booking_request(
                     current_token, user_id, date, start_time, end_time,
-                    venue_id, price, cookies=current_cookies
+                    venue_id, price, cookies=current_cookies, user_agent=current_user_agent
                 )
                 
                 if ok_renew:
@@ -790,21 +987,82 @@ def lock_worker(task_id, stop_event, token, user_id, date, start_time, end_time,
                     # 🔑 关键：更新成功时间点
                     last_success_time = time.time()
                     add_log(f"✅ [Task {task_id}] 第 {renew_count} 次续订成功! 新基准: {datetime.datetime.now().strftime('%H:%M:%S')}", username=account_name)
+                    
+                    # 🔑 续订后刷新: 如果之前标记了需要刷新（Cookie 有效期 3-14 分钟）
+                    if need_refresh_after_renew:
+                        add_log(f"🔄 [Task {task_id}] 续订成功，开始刷新 Cookie...", username=account_name)
+                        pwd = None
+                        with SESSION_LOCK:
+                            if account_name in USER_SESSIONS:
+                                pwd = USER_SESSIONS[account_name].get('password')
+                        if pwd:
+                            try:
+                                status, res = deduplicated_login(account_name, pwd)
+                                if status == "success":
+                                    current_token = res['token']
+                                    current_cookies = res['cookies']
+                                    current_user_agent = res.get('user_agent')
+                                    last_credential_refresh = time.time()
+                                    current_credential_timestamp = time.time()
+                                    add_log(f"✅ [Task {task_id}] 续订后 Cookie 刷新成功！", username=account_name)
+                                else:
+                                    add_log(f"⚠️ [Task {task_id}] 续订后刷新失败: {res}", username=account_name)
+                            except Exception as post_refresh_err:
+                                add_log(f"⚠️ [Task {task_id}] 续订后刷新异常: {post_refresh_err}", username=account_name)
+                    
                     round_success = True
                     break
                 
                 time.sleep(0.3)
             
             if not round_success and not stop_event.is_set():
-                add_log(f"❌ [Task {task_id}] 本轮续订失败，场地可能已丢失。", username=account_name)
-                # 发送失败邮件通知
-                if email:
-                    send_lock_failed_email(email, account_name, venue_name, f"第 {renew_count + 1} 次续订失败，60秒窗口内所有尝试均未成功")
-                with TASK_LOCK:
-                    if task_id in TASK_MANAGER:
-                        TASK_MANAGER[task_id]['status'] = "续订失败"
-                stop_event.set()
-                break
+                # === 失败后立即尝试刷新凭证并重试 ===
+                add_log(f"⚠️ [Task {task_id}] 续订失败，尝试刷新凭证后重试...", username=account_name)
+                pwd = None
+                with SESSION_LOCK:
+                    if account_name in USER_SESSIONS:
+                        pwd = USER_SESSIONS[account_name].get('password')
+                
+                rescue_success = False
+                if pwd:
+                    try:
+                        status, res = deduplicated_login(account_name, pwd)
+                        if status == "success":
+                            current_token = res['token']
+                            current_cookies = res['cookies']
+                            current_user_agent = res.get('user_agent')
+                            last_credential_refresh = time.time()
+                            current_credential_timestamp = time.time()  # 🔑 更新凭证时间戳
+                            add_log(f"✅ [Task {task_id}] 凭证刷新成功，立即重试续订...", username=account_name)
+                            
+                            # 立即重试续订（3次机会）
+                            for retry in range(3):
+                                ok_retry, msg_retry, _ = send_booking_request(
+                                    current_token, user_id, date, start_time, end_time,
+                                    venue_id, price, cookies=current_cookies, user_agent=current_user_agent
+                                )
+                                if ok_retry:
+                                    renew_count += 1
+                                    last_success_time = time.time()
+                                    add_log(f"✅ [Task {task_id}] 救援续订成功！（第 {retry + 1} 次尝试）", username=account_name)
+                                    rescue_success = True
+                                    break
+                                time.sleep(0.5)
+                    except Exception as rescue_err:
+                        add_log(f"⚠️ [Task {task_id}] 救援异常: {rescue_err}", username=account_name)
+                
+                if not rescue_success:
+                    add_log(f"❌ [Task {task_id}] 本轮续订失败，场地可能已丢失。", username=account_name)
+                    # 发送失败邮件通知
+                    if email:
+                        send_lock_failed_email(email, account_name, venue_name, f"第 {renew_count + 1} 次续订失败，刷新凭证后仍无法成功")
+                    with TASK_LOCK:
+                        if task_id in TASK_MANAGER:
+                            TASK_MANAGER[task_id]['status'] = "续订失败"
+                    stop_event.set()
+                    break
+                else:
+                    round_success = True  # 救援成功，标记为成功
             
             # 续订成功，更新状态
             with TASK_LOCK:
@@ -833,11 +1091,13 @@ def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time
     
     current_token = token
     current_cookies = {}
+    current_user_agent = None
     
-    # 初始获取 Cookies
+    # 初始获取 Cookies 和 UA
     with SESSION_LOCK:
         if username in USER_SESSIONS:
             current_cookies = USER_SESSIONS[username].get('cookies', {})
+            current_user_agent = USER_SESSIONS[username].get('user_agent')
 
     with TASK_LOCK:
         if task_id in TASK_MANAGER:
@@ -867,6 +1127,7 @@ def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time
                 if cached.get('token') and cached.get('token') != current_token:
                     current_token = cached['token']
                     current_cookies = cached.get('cookies', {})
+                    current_user_agent = cached.get('user_agent')
                     # add_log(f"🔄 [Task {task_id}] 同步新凭证", username=username)
 
         # 2. 查询场地
@@ -902,10 +1163,10 @@ def snipe_worker(task_id, stop_event, token, user_id, date, start_time, end_time
             
             add_log(f"🎯 [Task {task_id}] 发现可用场地: {v_name} ({v_id})", username=username)
             
-            # 4. 尝试预定
-            ok, msg = send_booking_request(
+            # 4. 尝试预定（使用登录时的UA）
+            ok, msg, _ = send_booking_request(
                 current_token, user_id, date, start_time, end_time,
-                v_id, v_price, cookies=current_cookies
+                v_id, v_price, cookies=current_cookies, user_agent=current_user_agent
             )
             
             if ok:
@@ -985,16 +1246,18 @@ async def start_monitor(request: Request):
     
     # 情况1: 前端指定了具体场地 + 无限锁场
     if venue_id and is_lock_mode:
-        # 获取 cookies
+        # 获取 cookies 和 UA
         cookies = {}
+        user_agent = None
         with SESSION_LOCK:
             if username in USER_SESSIONS:
                 cookies = USER_SESSIONS[username].get('cookies', {})
+                user_agent = USER_SESSIONS[username].get('user_agent')
         
-        # 先执行单次预定
-        ok, msg = send_booking_request(
+        # 先执行单次预定（使用登录时的UA）
+        ok, msg, _ = send_booking_request(
             token, user_id, date, start_time, end_time, venue_id, price,
-            cookies=cookies
+            cookies=cookies, user_agent=user_agent
         )
         
         if ok:
